@@ -544,6 +544,27 @@ def test_main_extract_all_failed(capsys, monkeypatch):
     assert rc == cli.EXIT_AUTH
 
 
+def test_main_search_text_maps_to_markdown_note(capsys, monkeypatch, search_with_content_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, search_with_content_fixture))
+    rc = cli.main(["search", "q", "--max-results", "2", "--raw-content", "text", "--stdout"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "text maps to markdown" in captured.err
+    out = json.loads(captured.out)
+    assert out["data"]["results"][0]["raw_content"] is not None
+
+
+def test_main_extract_format_text_note(capsys, monkeypatch, scrape_ok_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, scrape_ok_fixture))
+    rc = cli.main(["extract", "https://example.com", "--format", "text", "--stdout"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "text maps to markdown" in captured.err
+    assert json.loads(captured.out)["data"]["result_count"] == 1
+
+
 def test_main_search_file_output(capsys, tmp_path, monkeypatch, search_with_content_fixture):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
     monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, search_with_content_fixture))

@@ -724,6 +724,11 @@ def run_search(
             f"Note: --search-depth {args.search_depth!r} is ignored (Firecrawl has a single search mode).",
             file=sys.stderr,
         )
+    if args.raw_content == "text":
+        print(
+            "Note: --raw-content text maps to markdown (Firecrawl has no text tier).",
+            file=sys.stderr,
+        )
     request = _build_search_request(args)
     status, payload = _post_json("/search", request, api_key, args.timeout)
     code = _exit_code_for(status, payload)
@@ -744,6 +749,11 @@ def run_extract(
     if args.chunks_per_source is not None:
         print(
             "Note: --chunks-per-source is ignored (Firecrawl highlights have no chunk-count control).",
+            file=sys.stderr,
+        )
+    if args.format == "text":
+        print(
+            "Note: --format text maps to markdown (Firecrawl has no text tier).",
             file=sys.stderr,
         )
 
