@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "data": {
+    "remainingCredits": 4200,
+    "planCredits": 5000,
+    "billingPeriodStart": "2025-01-01T00:00:00.000Z",
+    "billingPeriodEnd": "2025-02-01T00:00:00.000Z"
+  }
+}

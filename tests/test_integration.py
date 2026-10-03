@@ -83,3 +83,22 @@ def test_extract_live_bad_url_degrades_gracefully(api_key):
     assert rc in (cli.EXIT_OK, cli.EXIT_NETWORK_SERVER, cli.EXIT_REJECTED)
     if payload is not None:
         assert payload["data"]["result_count"] == 0 or payload["data"]["failed_count"] == 1
+
+
+def test_usage_live(api_key):
+    """One read-only billing call. Consumes 0 Firecrawl credits."""
+    rc, payload, error = cli.run_usage(
+        cli.build_parser().parse_args(["usage"]),
+        api_key,
+    )
+    assert rc == 0, error
+    data = payload["data"]
+    assert data["provider"] == "firecrawl"
+    assert isinstance(data["remaining_credits"], int) and data["remaining_credits"] >= 0
+    assert isinstance(data["plan_credits"], int) and data["plan_credits"] > 0
+    assert data["credits_used_in_period"] == data["plan_credits"] - data["remaining_credits"]
+    assert data["billing_period_start"] and data["billing_period_end"]
+    # raw carries the upstream body verbatim, so the normalized fields above can be
+    # audited against it.
+    assert data["raw"]["credit_usage"]["data"]["remainingCredits"] == data["remaining_credits"]
+    assert data["periods"] == []
