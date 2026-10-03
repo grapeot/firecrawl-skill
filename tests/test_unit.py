@@ -1,7 +1,9 @@
 """Offline unit tests: no network, no API key required."""
 import argparse
+import contextlib
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +39,14 @@ def test_extract_defaults():
     assert args.format == "markdown"
     assert args.query is None
     assert args.include_favicon is False
+
+
+def test_usage_defaults():
+    args = parse(["usage"])
+    assert args.timeout == cli.DEFAULT_TIMEOUT
+    assert args.history == 0
+    assert args.stdout is False
+    assert args.output is None
 
 
 def test_missing_command_exits_usage():
@@ -96,6 +106,19 @@ def test_stdout_and_output_mutually_exclusive():
 def test_extract_url_limit():
     urls = [f"https://example.com/{i}" for i in range(21)]
     usage_error(["extract", *urls])
+
+
+def test_usage_history_out_of_range():
+    usage_error(["usage", "--history", "-1"])
+    usage_error(["usage", "--history", str(cli.MAX_USAGE_PERIODS + 1)])
+
+
+def test_usage_timeout_must_be_positive():
+    usage_error(["usage", "--timeout", "0"])
+
+
+def test_usage_stdout_and_output_mutually_exclusive():
+    usage_error(["usage", "--stdout", "--output", "x.json"])
 
 
 def test_chunks_per_source_requires_query():
@@ -330,6 +353,113 @@ def test_scrape_credits_used_variants():
 
 
 # ---------------------------------------------------------------------------
+# Normalization (usage)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_usage_response(credit_usage_fixture):
+    args = parse(["usage"])
+    out = cli._normalize_usage_response(args, credit_usage_fixture, None)
+    assert out["command"] == "usage"
+    data = out["data"]
+    upstream = credit_usage_fixture["data"]
+    assert data["provider"] == "firecrawl"
+    assert data["remaining_credits"] == upstream["remainingCredits"]
+    assert data["plan_credits"] == upstream["planCredits"]
+    assert data["credits_used_in_period"] == (
+        upstream["planCredits"] - upstream["remainingCredits"]
+    )
+    assert data["billing_period_start"] == upstream["billingPeriodStart"]
+    assert data["billing_period_end"] == upstream["billingPeriodEnd"]
+    assert data["periods"] == []
+    # `raw` is the upstream body verbatim — nothing invented, nothing dropped.
+    assert data["raw"] == {"credit_usage": credit_usage_fixture}
+    assert "credit_usage_historical" not in data["raw"]
+
+
+def test_normalize_usage_response_with_history(credit_usage_fixture, credit_usage_historical_fixture):
+    args = parse(["usage", "--history", "4"])
+    out = cli._normalize_usage_response(args, credit_usage_fixture, credit_usage_historical_fixture)
+    data = out["data"]
+    assert len(data["periods"]) == len(credit_usage_historical_fixture["periods"])
+    first = credit_usage_historical_fixture["periods"][0]
+    assert data["periods"][0] == {
+        "start_date": first["startDate"],
+        "end_date": first["endDate"],
+        "credits_used": first["creditsUsed"],
+    }
+    assert data["raw"]["credit_usage_historical"] == credit_usage_historical_fixture
+
+
+def test_normalize_usage_period_open_ended(credit_usage_historical_fixture):
+    period = credit_usage_historical_fixture["periods"][-1]
+    normalized = cli._normalize_period(period)
+    assert normalized["end_date"] == period["endDate"]
+    assert normalized["credits_used"] == period["creditsUsed"]
+    assert "api_key" not in normalized  # periods never project apiKey (see D6)
+
+
+def test_normalize_period_total_credits_alias():
+    # The published OpenAPI example names this field totalCredits; the live API
+    # names it creditsUsed. Both must normalize to the same place.
+    assert cli._normalize_period({"startDate": "a", "endDate": "b", "totalCredits": 12})["credits_used"] == 12
+    assert cli._normalize_period({"startDate": "a", "endDate": "b", "creditsUsed": 12, "totalCredits": 99})[
+        "credits_used"
+    ] == 12
+
+
+def test_normalize_period_never_projects_api_key():
+    # The CLI never sends byApiKey=true, so a key name must not reach `periods`
+    # (it stays in `data.raw`). Same rule for a null or a real name.
+    assert cli._normalize_period({"startDate": "a", "endDate": "b", "creditsUsed": 1, "apiKey": None}) == {
+        "start_date": "a",
+        "end_date": "b",
+        "credits_used": 1,
+    }
+    assert "api_key" not in cli._normalize_period(
+        {"startDate": "a", "endDate": "b", "creditsUsed": 1, "apiKey": "Default"}
+    )
+
+
+def test_normalize_usage_input_records_by_api_key(credit_usage_fixture, credit_usage_historical_fixture):
+    # byApiKey is only meaningful once history is actually fetched.
+    assert "by_api_key" not in cli._normalize_usage_response(parse(["usage"]), credit_usage_fixture, None)["input"]
+    out = cli._normalize_usage_response(
+        parse(["usage", "--history", "2"]), credit_usage_fixture, credit_usage_historical_fixture
+    )
+    assert out["input"]["by_api_key"] is False
+
+
+def test_normalize_usage_input_records_history_count(credit_usage_fixture):
+    out = cli._normalize_usage_response(parse(["usage", "--history", "7"]), credit_usage_fixture, None)
+    assert out["input"]["history"] == 7
+
+
+def test_normalize_usage_response_missing_fields():
+    # Unknown/partial upstream bodies must not fabricate numbers.
+    out = cli._normalize_usage_response(parse(["usage"]), {"success": True, "data": {}}, None)
+    data = out["data"]
+    assert data["remaining_credits"] is None
+    assert data["plan_credits"] is None
+    assert data["credits_used_in_period"] is None
+    assert data["billing_period_start"] is None
+    assert data["raw"] == {"credit_usage": {"success": True, "data": {}}}
+
+
+def test_normalize_usage_response_missing_data_key():
+    out = cli._normalize_usage_response(parse(["usage"]), {"success": True}, None)
+    assert out["data"]["remaining_credits"] is None
+
+
+def test_int_or_none():
+    assert cli._int_or_none(7) == 7
+    assert cli._int_or_none(7.0) == 7
+    assert cli._int_or_none(None) is None
+    assert cli._int_or_none("7") is None
+    assert cli._int_or_none(True) is None
+
+
+# ---------------------------------------------------------------------------
 # Exit codes
 # ---------------------------------------------------------------------------
 
@@ -405,6 +535,14 @@ def test_default_output_path_search(tmp_path, monkeypatch):
     assert "hello_world" in path
 
 
+def test_default_output_path_usage(tmp_path, monkeypatch):
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+    args = parse(["usage"])
+    path = cli._default_output_path(args)
+    assert path.startswith(str(tmp_path))
+    assert "usage_" in path and path.endswith("_credits.json")
+
+
 # ---------------------------------------------------------------------------
 # .env loading and key resolution
 # ---------------------------------------------------------------------------
@@ -476,6 +614,16 @@ def test_emit_payload_file(capsys, tmp_path):
     assert status["output_path"] == str(out_file)
     assert status["summary"]["result_count"] == 2
     assert "payload_schema" in status
+    # The summary block is shared across commands; non-usage commands carry a null
+    # remaining_credits so consumers can read one shape everywhere.
+    assert status["summary"]["remaining_credits"] is None
+    assert set(status["summary"]) == {
+        "result_count",
+        "failed_count",
+        "image_count",
+        "credits_used",
+        "remaining_credits",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -574,3 +722,230 @@ def test_main_search_file_output(capsys, tmp_path, monkeypatch, search_with_cont
     assert out_file.exists()
     status = json.loads(capsys.readouterr().out)
     assert status["output_path"] == str(out_file)
+
+
+# ---------------------------------------------------------------------------
+# usage: run_usage and main() with stubbed transport
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def monkeypatched_get(fake_get):
+    original = cli._get_json
+    cli._get_json = fake_get
+    try:
+        yield
+    finally:
+        cli._get_json = original
+
+
+def stub_get(responses):
+    """Return a _get_json replacement serving (status, body) per call in order."""
+    calls = []
+
+    def fake_get(path, key, timeout, params=None):
+        calls.append({"path": path, "timeout": timeout, "params": params})
+        index = len(calls) - 1
+        if index < len(responses):
+            return responses[index]
+        return 404, {"success": False, "error": "unexpected call"}
+
+    return fake_get, calls
+
+
+def test_run_usage_success(credit_usage_fixture):
+    args = parse(["usage"])
+    fake_get, calls = stub_get([(200, credit_usage_fixture)])
+    with monkeypatched_get(fake_get):
+        code, payload, error = cli.run_usage(args, "fc-test-key")
+    assert code == 0
+    assert error is None
+    assert payload["data"]["remaining_credits"] == credit_usage_fixture["data"]["remainingCredits"]
+    assert calls[0]["path"] == cli.USAGE_PATH
+    assert calls[0]["timeout"] == cli.DEFAULT_TIMEOUT
+    assert calls[0]["params"] is None
+
+
+def test_run_usage_history_dedupes_current_period(live_usage_pair):
+    current, historical = live_usage_pair
+    args = parse(["usage", "--history", "4"])
+    fake_get, calls = stub_get([(200, current), (200, historical)])
+    with monkeypatched_get(fake_get):
+        code, payload, _ = cli.run_usage(args, "fc-test-key")
+    assert code == 0
+    assert calls[1]["path"] == cli.USAGE_HISTORICAL_PATH
+    # The historical endpoint repeats the open current period, which the primary
+    # call already reports; it must appear once, in the balance fields only.
+    starts = [p_["start_date"] for p_ in payload["data"]["periods"]]
+    assert current["data"]["billingPeriodStart"] not in starts
+    assert starts == ["2024-07-01T00:00:00.000Z", "2024-08-01T00:00:00.000Z", "2024-09-01T00:00:00.000Z"]
+
+
+def test_run_usage_history_caps_at_n(live_usage_pair):
+    current, historical = live_usage_pair
+    args = parse(["usage", "--history", "2"])
+    fake_get, _ = stub_get([(200, current), (200, historical)])
+    with monkeypatched_get(fake_get):
+        _, payload, _ = cli.run_usage(args, "fc-test-key")
+    starts = [p_["start_date"] for p_ in payload["data"]["periods"]]
+    assert starts == ["2024-07-01T00:00:00.000Z", "2024-08-01T00:00:00.000Z"]
+
+
+def test_run_usage_history_keeps_extra_open_periods(live_usage_pair):
+    """Only the current period is deduped; other open-ended periods are kept."""
+    current, historical = live_usage_pair
+    current = json.loads(json.dumps(current))
+    current["data"]["billingPeriodStart"] = "2024-10-01T00:00:00.000Z"
+    historical["periods"][0]["endDate"] = None  # a second, genuinely open period
+    args = parse(["usage", "--history", "10"])
+    fake_get, _ = stub_get([(200, current), (200, historical)])
+    with monkeypatched_get(fake_get):
+        _, payload, _ = cli.run_usage(args, "fc-test-key")
+    starts = [p_["start_date"] for p_ in payload["data"]["periods"]]
+    assert "2024-07-01T00:00:00.000Z" in starts  # open period survives
+    assert "2024-10-01T00:00:00.000Z" not in starts  # current period deduped
+
+
+def test_run_usage_history_api_key_not_requested(live_usage_pair):
+    """byApiKey stays at its default: no API-key names enter the normalized periods."""
+    current, historical = live_usage_pair
+    assert "apiKey" in historical["periods"][0]  # upstream does send it in some shapes
+    args = parse(["usage", "--history", "4"])
+    fake_get, calls = stub_get([(200, current), (200, historical)])
+    with monkeypatched_get(fake_get):
+        _, payload, _ = cli.run_usage(args, "fc-test-key")
+    assert calls[1]["params"] is None  # no byApiKey query param is ever sent
+    assert all("api_key" not in p_ for p_ in payload["data"]["periods"])
+    # but nothing is hidden from raw, so the passthrough decision stays auditable
+    assert payload["data"]["raw"]["credit_usage_historical"]["periods"][0]["apiKey"] == "Default"
+
+
+def test_run_usage_history_failure_is_not_fatal(capsys, credit_usage_fixture):
+    args = parse(["usage", "--history", "3"])
+    fake_get, _ = stub_get([(200, credit_usage_fixture), (500, {"success": False, "error": "boom"})])
+    with monkeypatched_get(fake_get):
+        code, payload, error = cli.run_usage(args, "fc-test-key")
+    assert code == 0, error
+    assert payload["data"]["periods"] == []
+    assert payload["data"]["raw"]["credit_usage_historical"] == {"periods": []}
+    assert "historical periods unavailable" in capsys.readouterr().err
+
+
+def test_run_usage_auth_error():
+    args = parse(["usage"])
+    fake_get, _ = stub_get([(401, {"success": False, "error": "invalid api key"})])
+    with monkeypatched_get(fake_get):
+        code, payload, error = cli.run_usage(args, "fc-test-key")
+    assert code == cli.EXIT_AUTH
+    assert payload is None
+    assert error["http_status"] == 401
+
+
+def test_run_usage_not_found_maps_to_rejected(credit_usage_not_found_fixture):
+    # 404 is the documented "no credit usage information" response → 12, no new codes.
+    args = parse(["usage"])
+    fake_get, _ = stub_get([(404, credit_usage_not_found_fixture)])
+    with monkeypatched_get(fake_get):
+        code, _, error = cli.run_usage(args, "fc-test-key")
+    assert code == cli.EXIT_REJECTED
+    assert "Could not find credit usage" in error["error"]
+
+
+def test_run_usage_network_error():
+    args = parse(["usage"])
+    fake_get, _ = stub_get([(None, None)])
+    with monkeypatched_get(fake_get):
+        code, _, error = cli.run_usage(args, "fc-test-key")
+    assert code == cli.EXIT_NETWORK_SERVER
+    assert error["http_status"] is None
+
+
+def test_run_usage_success_false_maps_to_rejected():
+    args = parse(["usage"])
+    fake_get, _ = stub_get([(200, {"success": False, "error": "Internal server error while fetching credit usage"})])
+    with monkeypatched_get(fake_get):
+        code, _, error = cli.run_usage(args, "fc-test-key")
+    assert code == cli.EXIT_REJECTED
+
+
+def test_run_usage_prints_no_credit_estimate(capsys, credit_usage_fixture):
+    args = parse(["usage"])
+    fake_get, _ = stub_get([(200, credit_usage_fixture)])
+    with monkeypatched_get(fake_get):
+        cli.run_usage(args, "fc-test-key")
+    assert "Estimated Firecrawl credits" not in capsys.readouterr().err
+
+
+def test_main_usage_stdout(capsys, monkeypatch, credit_usage_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    fake_get, _ = stub_get([(200, credit_usage_fixture)])
+    monkeypatch.setattr(cli, "_get_json", fake_get)
+    rc = cli.main(["usage", "--stdout"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["command"] == "usage"
+    assert out["data"]["provider"] == "firecrawl"
+    assert out["data"]["remaining_credits"] == credit_usage_fixture["data"]["remainingCredits"]
+    assert out["data"]["raw"]["credit_usage"] == credit_usage_fixture
+
+
+def test_main_usage_file_output(capsys, monkeypatch, tmp_path, credit_usage_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    fake_get, _ = stub_get([(200, credit_usage_fixture)])
+    monkeypatch.setattr(cli, "_get_json", fake_get)
+    out_file = tmp_path / "usage.json"
+    rc = cli.main(["usage", "--output", str(out_file)])
+    assert rc == 0
+    assert json.loads(out_file.read_text())["data"]["remaining_credits"] == 4200
+    status = json.loads(capsys.readouterr().out)
+    assert status["command"] == "usage"
+    assert status["output_mode"] == "file"
+    assert status["output_path"] == str(out_file)
+    assert status["summary"]["remaining_credits"] == 4200
+    assert status["payload_schema"]["data"]["remaining_credits"] == "number|null"
+
+
+def test_main_usage_default_output_path(capsys, monkeypatch, tmp_path, credit_usage_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+    fake_get, _ = stub_get([(200, credit_usage_fixture)])
+    monkeypatch.setattr(cli, "_get_json", fake_get)
+    rc = cli.main(["usage"])
+    assert rc == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["output_path"].startswith(str(tmp_path))
+    assert "usage_" in status["output_path"]
+    assert Path(status["output_path"]).exists()
+
+
+def test_main_usage_auth_error_without_key(capsys, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    monkeypatch.delenv(cli._ONEPASSWORD_REF_ENV, raising=False)
+    rc = cli.main(["usage", "--stdout"])
+    assert rc == cli.EXIT_AUTH
+    err = json.loads([l for l in capsys.readouterr().err.splitlines() if l.strip()][-1])
+    assert err["command"] == "usage"
+
+
+def test_main_usage_upstream_error(capsys, monkeypatch, credit_usage_not_found_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    fake_get, _ = stub_get([(404, credit_usage_not_found_fixture)])
+    monkeypatch.setattr(cli, "_get_json", fake_get)
+    rc = cli.main(["usage", "--stdout"])
+    assert rc == cli.EXIT_REJECTED
+    err = json.loads([l for l in capsys.readouterr().err.splitlines() if l.strip()][-1])
+    assert err["command"] == "usage"
+    assert err["http_status"] == 404
+
+
+def test_main_usage_never_touches_post_transport(monkeypatch, tmp_path, credit_usage_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setattr(cli, "_post_json", unexpected_post)
+    fake_get, _ = stub_get([(200, credit_usage_fixture)])
+    monkeypatch.setattr(cli, "_get_json", fake_get)
+    assert cli.main(["usage", "--stdout"]) == 0
+
+
+def unexpected_post(path, body, key, timeout):
+    raise AssertionError("usage must use GET transport, not POST")
