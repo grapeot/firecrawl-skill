@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """firecrawl_skill CLI.
 
-Agent-facing web search and URL extraction over the Firecrawl v2 API.
-The command surface and output contract mirror tavily-skill; see docs/rfc.md.
+Agent-facing web search, URL extraction, and account credit-usage reporting over the
+Firecrawl v2 API. The search/extract command surface and output contract mirror
+tavily-skill; see docs/rfc.md.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import socket
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,13 @@ DEFAULT_EXTRACT_DEPTH = "advanced"
 DEFAULT_EXTRACT_FORMAT = "markdown"
 MAX_RESULTS_LIMIT = 20
 MAX_URLS_LIMIT = 20
+MAX_USAGE_PERIODS = 100
+
+# Upstream billing endpoints. `usage` reads the first; the historical endpoint is the
+# only upstream source of per-period consumption (`--history`). The path is
+# `/v2/team/credit-usage`, not `/v2/credit-usage` — see docs/rfc.md (D5).
+USAGE_PATH = "/team/credit-usage"
+USAGE_HISTORICAL_PATH = "/team/credit-usage/historical"
 
 SEARCH_DEPTH_CHOICES = ["basic", "advanced", "fast", "ultra-fast"]
 TOPIC_CHOICES = ["general", "news", "finance"]
@@ -306,6 +315,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include favicon URLs from page metadata when present",
     )
 
+    usage_parser = subparsers.add_parser(
+        "usage", help="Report Firecrawl account credit usage (no credits consumed)"
+    )
+    usage_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT})",
+    )
+    usage_parser.add_argument(
+        "--history",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            f"Include the N most recent billing periods of credit consumption "
+            f"(1-{MAX_USAGE_PERIODS}, default 0 = current period only)"
+        ),
+    )
+    usage_parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Print the full JSON payload to stdout instead of writing it to the default output file",
+    )
+    usage_parser.add_argument(
+        "--output",
+        help="Write the full usage payload to a file and return status JSON on stdout",
+    )
+
     return parser
 
 
@@ -327,6 +365,15 @@ def _build_tbs(args: argparse.Namespace) -> str | None:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.command == "usage":
+        if args.timeout <= 0:
+            parser.error("--timeout must be greater than 0.")
+        if args.stdout and args.output:
+            parser.error("Use either --stdout or --output, not both.")
+        if not 0 <= args.history <= MAX_USAGE_PERIODS:
+            parser.error(f"--history must be between 0 and {MAX_USAGE_PERIODS} (0 = current period only).")
+        return
+
     if args.command == "extract":
         if args.timeout <= 0:
             parser.error("--timeout must be greater than 0.")
@@ -454,22 +501,52 @@ def _post_json(path: str, body: dict[str, Any], api_key: str, timeout: float) ->
     except urllib.error.HTTPError as exc:
         status = exc.code
         try:
-            payload = json.loads(exc.read().decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            payload = None
-        if not isinstance(payload, dict):
-            payload = None
-        return status, payload
+            raw = exc.read().decode("utf-8")
+        except UnicodeDecodeError:
+            raw = ""
+        return status, _parse_json_dict(raw)
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError):
         return None, None
 
+    return status, _parse_json_dict(raw)
+
+
+def _parse_json_dict(raw: str) -> dict[str, Any] | None:
     try:
         payload = json.loads(raw)
     except (ValueError, UnicodeDecodeError):
-        return status, None
-    if not isinstance(payload, dict):
-        return status, None
-    return status, payload
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _get_json(
+    path: str, api_key: str, timeout: float, params: dict[str, str] | None = None
+) -> tuple[int | None, dict[str, Any] | None]:
+    """GET JSON from the Firecrawl API. Returns (http_status, parsed_body).
+
+    Same contract as `_post_json`: http_status is None on network-level failure,
+    parsed_body is None when the response body was not a JSON object. The billing
+    endpoints need no request body, so params are the only query input.
+    """
+    url = API_BASE + path
+    if params:
+        url = url + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, _parse_json_dict(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8")
+        except UnicodeDecodeError:
+            raw = ""
+        return exc.code, _parse_json_dict(raw)
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError):
+        return None, None
 
 
 def _exit_code_for(status: int | None, payload: dict[str, Any] | None) -> int:
@@ -602,6 +679,76 @@ def _normalize_extract_result(args: argparse.Namespace, url: str, response: dict
 
 
 # ---------------------------------------------------------------------------
+# Normalization (usage)
+# ---------------------------------------------------------------------------
+
+
+def _int_or_none(value: Any) -> int | None:
+    """Upstream credit fields are numbers; keep them as ints, null when absent."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _normalize_period(item: dict[str, Any]) -> dict[str, Any]:
+    """One historical billing period.
+
+    Upstream returns `creditsUsed` in the live response; the published OpenAPI
+    example calls the same value `totalCredits`. Both names are read, first
+    present wins, so a spec rename does not silently null the field.
+
+    `apiKey` is deliberately not projected: the CLI never requests `byApiKey=true`,
+    and `input` records the request as `by_api_key: false`, so a key name appearing
+    here would contradict the recorded request. It stays visible in `data.raw`.
+    """
+    return {
+        "start_date": item.get("startDate"),
+        "end_date": item.get("endDate"),
+        "credits_used": _int_or_none(item.get("creditsUsed", item.get("totalCredits"))),
+    }
+
+
+def _normalize_usage_response(
+    args: argparse.Namespace, response: dict[str, Any], historical: dict[str, Any] | None
+) -> dict[str, Any]:
+    data = response.get("data") or {}
+    remaining = _int_or_none(data.get("remainingCredits"))
+    plan = _int_or_none(data.get("planCredits"))
+    used = None if remaining is None or plan is None else plan - remaining
+
+    input_block: dict[str, Any] = {
+        "timeout": args.timeout,
+        "history": args.history,
+        "stdout": args.stdout,
+        "output": args.output,
+    }
+    if args.history:
+        # The historical endpoint is the only second call, and it is always made with
+        # byApiKey left at its default — recorded so `periods` shape is explainable.
+        input_block["by_api_key"] = False
+    data_block: dict[str, Any] = {
+        "provider": "firecrawl",
+        "remaining_credits": remaining,
+        "plan_credits": plan,
+        "credits_used_in_period": used,
+        "billing_period_start": data.get("billingPeriodStart"),
+        "billing_period_end": data.get("billingPeriodEnd"),
+        "periods": [],
+        # Normalized top-level fields only carry values the API returns; `raw` keeps
+        # the full upstream bodies verbatim so nothing is invented here.
+        "raw": {"credit_usage": response},
+    }
+
+    if historical is not None:
+        data_block["periods"] = [_normalize_period(p) for p in historical.get("periods") or []]
+        data_block["raw"]["credit_usage_historical"] = historical
+
+    return {"command": "usage", "input": input_block, "data": data_block}
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -629,6 +776,7 @@ def _emit_payload(payload: dict[str, Any], output_path: str | None) -> None:
             "failed_count": data.get("failed_count"),
             "image_count": data.get("image_count"),
             "credits_used": data.get("credits_used"),
+            "remaining_credits": data.get("remaining_credits"),
         },
         "payload_schema": _payload_schema(command),
     }
@@ -647,6 +795,8 @@ def _default_output_path(args: argparse.Namespace) -> str:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.command == "search":
         seed = args.query
+    elif args.command == "usage":
+        seed = "credits"
     else:
         seed = args.urls[0]
     slug = _slugify(seed)
@@ -678,6 +828,20 @@ def _payload_schema(command: object) -> dict[str, Any]:
                 "image_count": "number",
             },
         }
+    if command == "usage":
+        return {
+            **base,
+            "data": {
+                "provider": "string",
+                "remaining_credits": "number|null",
+                "plan_credits": "number|null",
+                "credits_used_in_period": "number|null",
+                "billing_period_start": "string|null",
+                "billing_period_end": "string|null",
+                "periods": "array",
+                "raw": "object",
+            },
+        }
     return {
         **base,
         "data": {
@@ -707,6 +871,10 @@ def _estimate_extract_credits(args: argparse.Namespace) -> int:
 
 
 def _print_credit_estimate(command: str, estimate: int) -> None:
+    if command == "usage":
+        # R7 applies to credit-consuming calls only; usage reads a billing endpoint
+        # that costs nothing, and printing an estimate here would imply otherwise.
+        return
     print(f"Estimated Firecrawl credits: {estimate}", file=sys.stderr)
 
 
@@ -811,6 +979,44 @@ def run_extract(
     return EXIT_OK, payload_out, None
 
 
+def run_usage(
+    args: argparse.Namespace, api_key: str
+) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
+    """Report account credit usage. Consumes zero Firecrawl credits.
+
+    With `--history N` a second read-only call fetches billing-period consumption.
+    The current period is already served by the primary endpoint, so only earlier
+    periods are merged in; consumers get the full history in `data.periods`.
+    """
+    status, payload = _get_json(USAGE_PATH, api_key, args.timeout)
+    code = _exit_code_for(status, payload)
+    if code != EXIT_OK:
+        return code, None, {"http_status": status, "error": _error_message(status, payload)}
+    response = payload or {}
+
+    historical: dict[str, Any] | None = None
+    if args.history:
+        current = (response.get("data") or {}).get("billingPeriodStart")
+        h_status, h_payload = _get_json(USAGE_HISTORICAL_PATH, api_key, args.timeout)
+        h_code = _exit_code_for(h_status, h_payload)
+        if h_code == EXIT_OK:
+            periods = (h_payload or {}).get("periods") or []
+            historical = {
+                "periods": [p for p in periods if p.get("startDate") != current][: args.history]
+            }
+        else:
+            # The primary payload is valid, so this is not a failure; the gap is
+            # reported on stderr and kept in `raw` so consumers can tell.
+            print(
+                f"Warning: historical periods unavailable ({_error_message(h_status, h_payload)}); "
+                "reporting current billing period only.",
+                file=sys.stderr,
+            )
+            historical = {"periods": []}
+
+    return EXIT_OK, _normalize_usage_response(args, response, historical), None
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -836,6 +1042,8 @@ def main(argv: list[str] | None = None) -> int:
             code, payload, error = run_search(args, api_key)
         elif args.command == "extract":
             code, payload, error = run_extract(args, api_key)
+        elif args.command == "usage":
+            code, payload, error = run_usage(args, api_key)
         else:
             parser.error(f"Unsupported command: {args.command}")
             return EXIT_USAGE
