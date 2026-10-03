@@ -4,13 +4,15 @@ Status: accepted (2026-09-29). Supersedes the internal design memo of the same d
 
 ## Summary
 
-A thin, stdlib-only Python CLI over the Firecrawl v2 API (`POST https://api.firecrawl.dev/v2/search`, `POST /v2/scrape`) that mirrors the tavily-skill command surface and output envelope, so downstream workflows switch by replacing the module name and the key.
+A thin, stdlib-only Python CLI over the Firecrawl v2 API (`POST https://api.firecrawl.dev/v2/search`, `POST /v2/scrape`, plus `GET /v2/team/credit-usage` for the `usage` subcommand) that mirrors the tavily-skill command surface and output envelope, so downstream workflows switch by replacing the module name and the key.
 
 ## Key decisions
 
 ### D1 — Standard library transport (no runtime dependencies)
 
 `urllib.request` handles everything needed: POST with a JSON body, `Authorization: Bearer` header, per-request timeout, and HTTP status inspection. Following the track17-skill invariant ("standard library only in `src/`") keeps the public repo dependency-free and the install trivial.
+
+`usage` needs the same transport as a GET (no body, `Authorization` header, per-request timeout), so `_get_json` was added beside `_post_json` and both share one JSON-body parser. Still stdlib `urllib.request`.
 
 Supersedes the internal memo's `httpx` decision. Rationale: the two endpoints used are simple enough that an HTTP client library buys little; a pinned raw request body is also more stable against fast-moving upstream API changes (parameters fail loudly instead of silently dropping).
 
@@ -78,6 +80,30 @@ Upstream: `POST /v2/scrape`, one request per URL, sequential.
 
 Per-URL result shape: `{url, markdown: <upstream data.markdown>, highlights, images, metadata, error: null}`; on failure: `{url, error: <upstream error string or HTTP status>}`. `data.credits_used` is the sum across successful scrapes (upstream `creditsUsed`/`metadata.creditCount` when present).
 
+## API mapping — `usage`
+
+Upstream: `GET https://api.firecrawl.dev/v2/team/credit-usage` (the docs page is `/api-reference/endpoint/credit-usage`; the v2 OpenAPI registers the path under `/team/`).
+
+### D5 — credit-usage endpoint path is `/v2/team/credit-usage`
+
+Verified empirically on 2026-10-03 against the live API with a real key:
+
+| Candidate | Result |
+|---|---|
+| `GET /v2/credit-usage` | **404** `{"success":false,"code":"NOT_FOUND","error":"GET /v2/credit-usage is not a Firecrawl API endpoint."}` |
+| `GET /v2/billing/usage` | **404** same `NOT_FOUND` envelope |
+| `GET /v2/usage` | **404** same `NOT_FOUND` envelope |
+| `GET /v2/team/credit-usage` | **200** `{"success":true,"data":{…}}` |
+| `GET /v2/team/credit-usage/historical` | **200** `{"success":true,"periods":[…]}` |
+
+The upstream 404 envelope carries `code: "NOT_FOUND"` and a `documentation_url`, which distinguishes "wrong path" from "no credit info"; the CLI does not branch on it. The path is also cross-checked against the published `api-reference/v2-openapi.json`, which registers `/team/credit-usage`.
+
+### D6 — historical consumption needs a second endpoint
+
+`GET /v2/team/credit-usage` returns only the current period's balance, so per-period burn is only available from `GET /v2/team/credit-usage/historical` (`?byApiKey` is left at its default `false`, so no API-key names appear in payloads). The CLI uses this second endpoint **only** for `--history N`. Both calls are GETs on billing endpoints and consume 0 credits.
+
+Field-name drift on the historical endpoint: the OpenAPI response schema names the per-period value `totalCredits`, the live response names it `creditsUsed`. `_normalize_period` reads `creditsUsed` first and falls back to `totalCredits`, so a rename in either direction leaves `credits_used` populated instead of silently `null`.
+
 ## Validation rules
 
 1. `--include-domain` and `--exclude-domain` are mutually exclusive (search).
@@ -88,6 +114,18 @@ Per-URL result shape: `{url, markdown: <upstream data.markdown>, highlights, ima
 6. Extract URL count in 1–20.
 7. `--image-descriptions`, `--topic finance` → usage error.
 8. Invalid dates → usage error with the offending value.
+9. `usage`: `--timeout` > 0; `--history` in 0–100; `--stdout` and `--output` mutually exclusive.
+
+## Normalization — `usage`
+
+`data = {provider: "firecrawl", remaining_credits, plan_credits, credits_used_in_period, billing_period_start, billing_period_end, periods, raw}`.
+
+- `remainingCredits` → `remaining_credits`, `planCredits` → `plan_credits`, `billingPeriodStart`/`billingPeriodEnd` → `billing_period_start`/`billing_period_end` (values passed through unchanged, including `null`).
+- `credits_used_in_period` is the only derived field: `plan_credits - remaining_credits`, `null` when either input is absent. No other arithmetic.
+- Firecrawl returns no plan **name** on any billing endpoint, so no plan name is reported; `plan_credits` is the nearest available signal.
+- `periods[]` entries are exactly `{start_date, end_date, credits_used}`. `apiKey` is never projected into `periods` even if an upstream response includes it: the CLI always requests the default `byApiKey=false` and records `input.by_api_key: false`, so projecting a key name would contradict the recorded request. It remains visible in `data.raw`.
+- `raw` keeps the full upstream body/ies (`raw.credit_usage`, plus `raw.credit_usage_historical` when fetched). This is a deliberate exception to D2 — the tavily-skill "no `raw` passthrough" rule exists because search payloads are megabytes; a billing body is ~165 bytes, and verbatim upstream text is what makes the normalized fields auditable.
+- Status-object summary carries `remaining_credits` alongside the existing keys on every command (`null` for search/extract) so consumers read one summary shape.
 
 ## Exit codes and HTTP mapping
 
@@ -99,6 +137,8 @@ Per-URL result shape: `{url, markdown: <upstream data.markdown>, highlights, ima
 | 402, 429 | 11 |
 | other 4xx (incl. `success: false` with 200) | 12 |
 | 408, 5xx, socket timeout, DNS/ConnectionError | 13 |
+
+The table applies unchanged to `usage`: the documented `404 Could not find credit usage information` maps to 12, a 5xx or unreachable billing endpoint to 13. No new codes were added (R5).
 
 Errors print a one-line JSON `{"command": ..., "error": ..., "http_status": ...}` to stderr and exit with the mapped code (stdout stays clean).
 
@@ -123,10 +163,15 @@ Auto-named under `FIRECRAWL_CLI_OUTPUT_DIR` (default `./tmp/firecrawl/`): `{comm
 ## Testing strategy
 
 - **Offline (`tests/test_unit.py`)**: argparse validation matrix (all rules above), ISO → `MM/DD/YYYY` conversion, `tbs` construction, request-body builders (search and extract, every flag combination that matters), envelope normalization from recorded fixtures, exit-code mapping from simulated HTTP responses (transport monkeypatched). No network, no key.
-- **Live (`tests/test_integration.py`, opt-in via `RUN_FIRECRAWL_INTEGRATION=1`)**: 3–5 real calls (plain search, search + content, `--time-range`, extract with `--query`), asserting `success`, `credits_used` present, `raw_content` non-empty. Consumes a small number of credits.
+- **Live (`tests/test_integration.py`, opt-in via `RUN_FIRECRAWL_INTEGRATION=1`)**: 3–5 real calls (plain search, search + content, `--time-range`, extract with `--query`), asserting `success`, `credits_used` present, `raw_content` non-empty. Consumes a small number of credits. The `usage` live test adds one read-only billing call (0 credits) asserting `remaining_credits`/`plan_credits` are ints and `raw.credit_usage` agrees with the normalized fields; it skips when no key resolves.
 
 ## Open items to verify against live responses during implementation
 
 - Exact `/v2/scrape` response schema and where `creditsUsed`/`creditCount` live.
 - Favicon field name in `metadata`.
 - Whether `--topic news` + content scraping behaves identically to web (schema indicates `markdown` on news items; confirm).
+
+Resolved during the `usage` work (2026-10-03):
+
+- Credit-usage path confirmed as `GET /v2/team/credit-usage`; `/v2/credit-usage`, `/v2/billing/usage` and `/v2/usage` are all 404 (D5).
+- `POST /v2/search` carries no credit-balance fields in body or headers — only `creditsUsed` for the call itself. Response headers are `access-control-allow-origin`, `content-length`, `content-type`, `date`, `etag`, `x-response-time`; there is no `x-ratelimit-*` or remaining-credits header. The billing endpoint is therefore the only source for the balance, and it is not rate-limited for reads.

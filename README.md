@@ -1,8 +1,8 @@
 # firecrawl-skill
 
-Agent-facing web search and URL extraction CLI backed by the [Firecrawl v2 API](https://docs.firecrawl.dev/api-reference/endpoint/search).
+Agent-facing web search, URL extraction, and account credit-usage reporting backed by the [Firecrawl v2 API](https://docs.firecrawl.dev/api-reference/endpoint/search).
 
-The CLI is a drop-in mirror of [tavily-skill](https://github.com/grapeot/tavily-skill): the same subcommands (`search`, `extract`), the same flag names and defaults, the same JSON envelope, and the same file-output behavior. Downstream workflows that consume tavily-skill payloads work unchanged.
+The search and extract commands are a drop-in mirror of [tavily-skill](https://github.com/grapeot/tavily-skill): the same subcommands (`search`, `extract`), the same flag names and defaults, the same JSON envelope, and the same file-output behavior. Downstream workflows that consume tavily-skill payloads work unchanged. `usage` is this repo's own addition — check it with `--help` before assuming any other flag names.
 
 ## Quickstart
 
@@ -34,6 +34,12 @@ python -m firecrawl_skill search "AI coding tools" --stdout
 # URL content extraction
 python -m firecrawl_skill extract https://example.com
 python -m firecrawl_skill extract https://example.com --query "agent search"
+
+# check remaining account credits (read-only, costs 0 credits)
+python -m firecrawl_skill usage --stdout
+
+# current balance plus the last 6 billing periods of consumption
+python -m firecrawl_skill usage --history 6 --stdout
 ```
 
 ## Configuration
@@ -58,6 +64,33 @@ URL content extraction via `POST /v2/scrape`, one request per URL (1–20 URLs p
 
 Full flag reference: `python -m firecrawl_skill search --help` / `extract --help`, or see `skills/skill_firecrawl.md`.
 
+### `usage`
+
+Account credit balance via `GET /v2/team/credit-usage` (read-only, consumes **0** credits). Flags: `--timeout` (default 60), `--history N` (1–100 closed billing periods of per-period consumption, from `GET /v2/team/credit-usage/historical`; `0` = current period only), `--stdout`, `--output`. No estimated-credits line is printed for this command — there is nothing to estimate.
+
+```bash
+python -m firecrawl_skill usage --stdout
+```
+
+```json
+{
+  "command": "usage",
+  "input": { "timeout": 60, "history": 0, "stdout": true, "output": null },
+  "data": {
+    "provider": "firecrawl",
+    "remaining_credits": 4200,
+    "plan_credits": 5000,
+    "credits_used_in_period": 800,
+    "billing_period_start": "2025-01-01T00:00:00.000Z",
+    "billing_period_end": "2025-02-01T00:00:00.000Z",
+    "periods": [],
+    "raw": { "credit_usage": { "success": true, "data": { "remainingCredits": 4200, "planCredits": 5000 } } }
+  }
+}
+```
+
+Normalized top-level fields mirror only what the upstream API returns; `credits_used_in_period` is derived as `plan_credits - remaining_credits` and is `null` when either input is missing. `data.raw` keeps the full upstream body verbatim, so every normalized field is auditable. `data.periods` holds `{start_date, end_date, credits_used}` per closed billing period (`end_date` is `null` for an open period) and stays empty without `--history`.
+
 ## Output
 
 The top-level structure is fixed:
@@ -75,7 +108,7 @@ The top-level structure is fixed:
 }
 ```
 
-In default mode the full payload is written to an auto-named file and stdout carries a lightweight status object. Use `--stdout` for the full payload inline, or `--output PATH` for a named file.
+In default mode the full payload is written to an auto-named file and stdout carries a lightweight status object. Use `--stdout` for the full payload inline, or `--output PATH` for a named file. The envelope shape above is the `search`/`extract` contract; `usage` reuses the `{command, input, data}` envelope with its own `data` block — see [`usage`](#usage) above.
 
 ## Exit codes
 
@@ -87,6 +120,18 @@ In default mode the full payload is written to an auto-named file and stdout car
 | 11 | Quota or rate limit (402/429) |
 | 12 | Request rejected, no data (other 4xx) |
 | 13 | Timeout or server error (408/5xx/network) |
+
+The mapping is identical for `usage`: a documented `404 Could not find credit usage information` maps to 12, an unreachable or 5xx billing endpoint to 13.
+
+## Credit accounting
+
+| Command | Credits |
+|---|---|
+| `search` | 2 per 10 results, + 1 per scraped page when `--raw-content` is on |
+| `extract` | 1 per page, + 4 per page with `--query` (highlights) |
+| `usage` | 0 (read-only billing endpoint) |
+
+`usage` is the only way to see your remaining balance from the CLI; it never costs credits. Firecrawl's plan name is not returned by any endpoint, so it is not reported — `plan_credits` is the plan's credit allotment and is the closest available signal.
 
 ## Differences from tavily-skill
 

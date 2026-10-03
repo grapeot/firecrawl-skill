@@ -22,6 +22,7 @@ The replacement must not force any change in downstream consumers: they call `py
 - **R5 — exit codes.** 0 ok / 2 usage / 10 auth (401/403) / 11 quota-rate (402/429) / 12 rejected-no-data (other 4xx) / 13 network-server (408/5xx/timeout). No new codes without updating README, skill doc, and tests together.
 - **R6 — offline-testable.** Unit tests must run with no network and no key.
 - **R7 — cost visibility.** Estimated credits are printed to stderr before the request when content scraping is enabled; actual `credits_used` lands in the payload.
+- **R8 — usage subcommand.** `usage` reports account credit balance from `GET /v2/team/credit-usage` (verified live, 2026-10-03): `data = {provider, remaining_credits, plan_credits, credits_used_in_period, billing_period_start, billing_period_end, periods, raw}`. Normalized top-level fields exist only where the API returns values; `raw` keeps the upstream body verbatim. `--history N` (1–100) adds closed billing periods from `GET /v2/team/credit-usage/historical`; `0` (default) is current period only. The call is read-only and consumes 0 credits, so no estimate is printed to stderr (R7 does not apply). Reuses the `{command, input, data}` envelope, the `--stdout`/`--output` semantics, and the R5 exit-code contract unchanged — no new codes.
 
 ## Non-goals (MVP)
 
@@ -50,3 +51,5 @@ The replacement must not force any change in downstream consumers: they call `py
 ## Cost model (measured local usage, 2026-09)
 
 Firecrawl: 2 credits per 10 results (rounded up) + 1 credit per scraped page. Local measured usage is ~1,100–1,700 full-content searches per month (payload corpus stats), ≈ 13,600 credits/month — above the Hobby tier (5,000 credits), inside Standard (100,000 credits, $83/mo annual).
+
+`usage` (R8) is the programmatic check for this model: it reads the remaining balance and the plan allotment directly, which is how the monthly burn above is measured without the web dashboard.
