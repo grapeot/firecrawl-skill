@@ -7,6 +7,7 @@
 - 2026-09-29 — CLI implemented (search/extract, stdlib urllib, tavily-skill envelope), 4 recorded fixtures, 74 offline unit tests + 5 opt-in integration tests, all green. Merged via PR #1.
 - 2026-09-29 — CI added (GitHub Actions, Python 3.9/3.12 matrix, setup-uv, offline pytest).
 - 2026-10-03 — `usage` subcommand added (R8/D5): `GET /v2/team/credit-usage` for the balance, `GET /v2/team/credit-usage/historical` behind `--history N` for closed billing periods. 0-credit read-only path, exit-code contract unchanged. 3 recorded fixtures (`credit_usage_ok`, `credit_usage_historical_ok`, `credit_usage_not_found`), 105 offline unit tests (+29) and 6 opt-in integration tests (+1), all green.
+- 2026-10-03 — Hardened `usage` normalization: a truthy non-dict upstream `data` (list/str/number) previously raised `AttributeError` and escaped `main()` as exit 1, violating the exit-code contract; now degrades to null fields (exit 0). Non-dict entries in historical `periods` are skipped rather than crashing. +2 regression tests (110 offline, all green).
 
 ## Lessons learned
 

@@ -713,7 +713,8 @@ def _normalize_period(item: dict[str, Any]) -> dict[str, Any]:
 def _normalize_usage_response(
     args: argparse.Namespace, response: dict[str, Any], historical: dict[str, Any] | None
 ) -> dict[str, Any]:
-    data = response.get("data") or {}
+    raw_data = response.get("data")
+    data = raw_data if isinstance(raw_data, dict) else {}
     remaining = _int_or_none(data.get("remainingCredits"))
     plan = _int_or_none(data.get("planCredits"))
     used = None if remaining is None or plan is None else plan - remaining
@@ -742,7 +743,9 @@ def _normalize_usage_response(
     }
 
     if historical is not None:
-        data_block["periods"] = [_normalize_period(p) for p in historical.get("periods") or []]
+        periods = historical.get("periods") or []
+        if isinstance(periods, list):
+            data_block["periods"] = [_normalize_period(p) for p in periods if isinstance(p, dict)]
         data_block["raw"]["credit_usage_historical"] = historical
 
     return {"command": "usage", "input": input_block, "data": data_block}
@@ -996,13 +999,18 @@ def run_usage(
 
     historical: dict[str, Any] | None = None
     if args.history:
-        current = (response.get("data") or {}).get("billingPeriodStart")
+        raw_data = response.get("data")
+        response_data = raw_data if isinstance(raw_data, dict) else {}
+        current = response_data.get("billingPeriodStart")
         h_status, h_payload = _get_json(USAGE_HISTORICAL_PATH, api_key, args.timeout)
         h_code = _exit_code_for(h_status, h_payload)
         if h_code == EXIT_OK:
             periods = (h_payload or {}).get("periods") or []
             historical = {
-                "periods": [p for p in periods if p.get("startDate") != current][: args.history]
+                "periods": [
+                    p for p in periods
+                    if isinstance(p, dict) and p.get("startDate") != current
+                ][: args.history]
             }
         else:
             # The primary payload is valid, so this is not a failure; the gap is
