@@ -451,6 +451,25 @@ def test_normalize_usage_response_missing_data_key():
     assert out["data"]["remaining_credits"] is None
 
 
+def test_normalize_usage_response_non_dict_data():
+    # A truthy non-dict `data` (list/str/number) must not crash normalization;
+    # it degrades to null fields rather than raising AttributeError.
+    for bad in ([1, 2, 3], "unexpected", 42):
+        out = cli._normalize_usage_response(parse(["usage"]), {"success": True, "data": bad}, None)
+        assert out["data"]["remaining_credits"] is None
+        assert out["data"]["plan_credits"] is None
+
+
+def test_normalize_usage_response_non_dict_periods():
+    # Historical periods that are not dicts must be skipped, not crash.
+    out = cli._normalize_usage_response(
+        parse(["usage", "--history", "3"]),
+        {"success": True, "data": {"remainingCredits": 1, "planCredits": 2}},
+        {"periods": [None, "x", {"startDate": "a", "endDate": "b", "creditsUsed": 5}]},
+    )
+    assert out["data"]["periods"] == [{"start_date": "a", "end_date": "b", "credits_used": 5}]
+
+
 def test_int_or_none():
     assert cli._int_or_none(7) == 7
     assert cli._int_or_none(7.0) == 7
