@@ -8,6 +8,7 @@
 - 2026-09-29 — CI added (GitHub Actions, Python 3.9/3.12 matrix, setup-uv, offline pytest).
 - 2026-10-03 — `usage` subcommand added (R8/D5): `GET /v2/team/credit-usage` for the balance, `GET /v2/team/credit-usage/historical` behind `--history N` for closed billing periods. 0-credit read-only path, exit-code contract unchanged. 3 recorded fixtures (`credit_usage_ok`, `credit_usage_historical_ok`, `credit_usage_not_found`), 105 offline unit tests (+29) and 6 opt-in integration tests (+1), all green.
 - 2026-10-03 — Hardened `usage` normalization: a truthy non-dict upstream `data` (list/str/number) previously raised `AttributeError` and escaped `main()` as exit 1, violating the exit-code contract; now degrades to null fields (exit 0). Non-dict entries in historical `periods` are skipped rather than crashing. +2 regression tests (110 offline, all green).
+- 2026-10-03 — Added `data.cost_breakdown` to `search` and `extract` payloads: per-document reconstruction of the credit charge (`base` = 2×ceil(results/10); HTML 1; x.com/twitter 30; PDF 1/page; unreturned 0), with `modelled_total`/`reported_total`/`reconciles`/`warning`. Best-effort, never blocks. Verified against 212 recorded search + 164 extract calls (2026-10), all reconcile exactly. +23 offline tests (133 total). Host matching handles FQDN trailing dots, case, ports, and rejects look-alikes (evilx.com, x.com.evil.com); bool JSON figures are rejected from billing arithmetic.
 
 ## Lessons learned
 

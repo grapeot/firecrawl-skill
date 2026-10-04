@@ -634,11 +634,30 @@ def _normalize_search_response(args: argparse.Namespace, response: dict[str, Any
             "images": images,
             "news": news,
             "credits_used": response.get("creditsUsed"),
+            "cost_breakdown": _search_cost_breakdown(results, response.get("creditsUsed")),
             "job_id": response.get("id"),
             "result_count": len(results),
             "image_count": len(images),
         },
     }
+
+
+def _search_cost_breakdown(
+    results: list[dict[str, Any]], reported: Any
+) -> dict[str, Any]:
+    base = _base_search_credits(len(results))
+    documents = _cost_documents(results, "raw_content")
+    reported_total = int(reported) if isinstance(reported, (int, float)) else None
+    return _build_cost_breakdown(base, documents, reported_total)
+
+
+def _base_search_credits(result_count: int) -> int:
+    """Search base cost: 2 credits per 10 results actually returned, rounded up. A search
+    that returns nothing bills 0 base. Verified against 212 recorded calls (2026-10).
+
+    The base keys off returned results, not the requested `--max-results`: a query that
+    asks for 6 but matches 0 pays nothing."""
+    return 2 * math.ceil(result_count / 10)
 
 
 def _normalize_highlights(value: Any) -> list[str]:
@@ -659,6 +678,136 @@ def _scrape_credits_used(response: dict[str, Any]) -> int | None:
         if isinstance(candidate, (int, float)):
             return int(candidate)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Cost breakdown (observability)
+# ---------------------------------------------------------------------------
+#
+# Firecrawl search = base (2 credits / 10 results, rounded up) + per-document scrape
+# cost. Per-document cost is not linear: HTML is 1 credit, x.com/twitter.com go through
+# the Grok API at 30 credits each, and PDFs bill 1 credit per page. The upstream
+# `creditsUsed` is authoritative; this breakdown reconstructs *why* it is what it is so
+# a finished payload can be audited after the fact. It is best-effort only and never
+# blocks: when the reconstruction disagrees with the reported total it records a warning
+# and moves on. See docs/rfc.md (D7).
+
+_X_HOSTS = ("x.com", "twitter.com")
+_PDF_CONTENT_TYPE = "application/pdf"
+
+
+def _host_of(url: Any) -> str:
+    try:
+        host = (urllib.parse.urlsplit(str(url)).hostname or "").lower()
+    except (ValueError, TypeError):
+        return ""
+    return host.rstrip(".")  # normalize FQDN trailing-dot form (x.com. -> x.com)
+
+
+def _is_x_host(host: str) -> bool:
+    return any(host == base or host.endswith("." + base) for base in _X_HOSTS)
+
+
+def _as_int(value: Any) -> int | None:
+    """Numeric fields upstream returns as int/float; bool is rejected (JSON true/false
+    must not be read as 1/0 in a billing figure)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _document_kind(url: Any, metadata: Any) -> str:
+    host = _host_of(url)
+    if _is_x_host(host):
+        return "x"
+    if isinstance(metadata, dict):
+        content_type = str(metadata.get("contentType") or "")
+        if content_type.startswith(_PDF_CONTENT_TYPE):
+            return "pdf"
+    return "html"
+
+
+def _document_cost(url: Any, metadata: Any, credits: int | None) -> tuple[str, int | None, dict[str, Any]]:
+    """Return (kind, credits, extra) for one returned document.
+
+    credits is None when upstream omitted the per-document figure; it is then inferred
+    from the kind (X = 30, PDF = page count when known, else 1). Inference only feeds the
+    breakdown, never the authoritative `credits_used`.
+    """
+    kind = _document_kind(url, metadata)
+    extra: dict[str, Any] = {}
+    pages: int | None = _as_int(metadata.get("numPages")) if isinstance(metadata, dict) else None
+    if kind == "pdf" and pages is not None:
+        extra["pages"] = pages
+    if credits is None:
+        if kind == "x":
+            credits = 30
+        elif kind == "pdf" and pages is not None:
+            credits = pages
+        else:
+            credits = 1
+    return kind, credits, extra
+
+
+def _build_cost_breakdown(
+    base: int,
+    documents: list[dict[str, Any]],
+    reported: int | None,
+) -> dict[str, Any]:
+    priced = [d for d in documents if _as_int(d.get("credits")) is not None]
+    modelled = base + sum(_as_int(d["credits"]) or 0 for d in priced)
+    reconciles: bool | None
+    warning: str | None
+    if reported is None:
+        reconciles = None
+        warning = None
+    elif modelled == reported:
+        reconciles = True
+        warning = None
+    else:
+        reconciles = False
+        warning = (
+            f"cost breakdown modelled {modelled} credits (base {base} + "
+            f"{len(priced)} priced document(s)) but the API reported {reported}; "
+            "the payload is unaffected — treat credits_used as authoritative."
+        )
+    return {
+        "base": base,
+        "documents": documents,
+        "modelled_total": modelled,
+        "reported_total": reported,
+        "reconciles": reconciles,
+        "warning": warning,
+    }
+
+
+def _metadata_credits(metadata: Any) -> int | None:
+    """The per-document charge upstream reports, or None when it is absent."""
+    if isinstance(metadata, dict):
+        return _as_int(metadata.get("creditsUsed", metadata.get("creditCount")))
+    return None
+
+
+def _cost_documents(results: list[dict[str, Any]], content_key: str) -> list[dict[str, Any]]:
+    """Per-document cost rows for a set of normalized results.
+
+    Firecrawl bills per *returned document*: for search the document is `raw_content`,
+    for extract it is `markdown`. No document => 0 credits, even if metadata came back.
+    """
+    documents: list[dict[str, Any]] = []
+    for item in results:
+        metadata = item.get("metadata")
+        if isinstance(item.get(content_key), str):
+            credits: int | None = _metadata_credits(metadata)
+        else:
+            credits = 0
+        kind, credits, extra = _document_cost(item.get("url"), metadata, credits)
+        entry: dict[str, Any] = {"url": item.get("url"), "kind": kind, "credits": credits}
+        entry.update(extra)
+        documents.append(entry)
+    return documents
 
 
 def _normalize_extract_result(args: argparse.Namespace, url: str, response: dict[str, Any]) -> dict[str, Any]:
@@ -826,6 +975,7 @@ def _payload_schema(command: object) -> dict[str, Any]:
                 "results": "array",
                 "failed_results": "array",
                 "credits_used": "number|null",
+                "cost_breakdown": "object",
                 "result_count": "number",
                 "failed_count": "number",
                 "image_count": "number",
@@ -853,6 +1003,7 @@ def _payload_schema(command: object) -> dict[str, Any]:
             "images": "array",
             "news": "array",
             "credits_used": "number|null",
+            "cost_breakdown": "object",
             "job_id": "string|null",
             "result_count": "number",
             "image_count": "number",
@@ -966,6 +1117,11 @@ def run_extract(
             "results": results,
             "failed_results": failed_results,
             "credits_used": total_credits if total_credits else None,
+            "cost_breakdown": _build_cost_breakdown(
+                0,
+                _cost_documents(results, "markdown"),
+                total_credits if total_credits else None,
+            ),
             "result_count": len(results),
             "failed_count": len(failed_results),
             "image_count": image_count,
