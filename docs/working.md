@@ -6,6 +6,7 @@
 - 2026-09-29 — API key verified against `POST /v2/search` (HTTP 200, `creditsUsed: 2`).
 - 2026-09-29 — CLI implemented (search/extract, stdlib urllib, tavily-skill envelope), 4 recorded fixtures, 74 offline unit tests + 5 opt-in integration tests, all green. Merged via PR #1.
 - 2026-09-29 — CI added (GitHub Actions, Python 3.9/3.12 matrix, setup-uv, offline pytest).
+- 2026-10-03 — Added `usage` subcommand (`GET /v2/team/credit-usage`): remaining credits, plan size, billing period, normalized into the standard envelope; no credits consumed. Mirrors tavily-skill's new `usage` command.
 
 ## Lessons learned
 

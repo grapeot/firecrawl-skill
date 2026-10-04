@@ -22,7 +22,7 @@ RUN_FIRECRAWL_INTEGRATION=1 python -m pytest tests/test_integration.py -v
 ## Invariants
 
 - Standard library only in `src/` — no third-party runtime dependencies. Tests may use pytest.
-- The CLI surface is a mirror of `tavily-skill` (`search` and `extract` subcommands, same flag names and defaults, same JSON envelope and file-output behavior). Do not change flag names or the envelope shape; downstream workflows depend on them.
+- The CLI surface is a mirror of `tavily-skill` (`search`, `extract`, and `usage` subcommands, same flag names and defaults, same JSON envelope and file-output behavior). Do not change flag names or the envelope shape; downstream workflows depend on them.
 - Every command prints exactly one JSON object to stdout: the full payload with `--stdout`, otherwise a lightweight status object with the payload path and a `payload_schema` hint.
 - Search results always carry a `raw_content` field (markdown) when content was requested, even though the upstream Firecrawl field is named `markdown`.
 - Exit codes are a contract: 0 ok / 2 usage / 10 auth / 11 quota-rate / 12 rejected-no-data / 13 network-server. Do not add new exit codes without updating the README, `skills/skill_firecrawl.md`, and the unit tests together.

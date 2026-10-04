@@ -39,6 +39,14 @@ def test_extract_defaults():
     assert args.include_favicon is False
 
 
+def test_usage_defaults():
+    args = parse(["usage"])
+    assert args.command == "usage"
+    assert args.stdout is False
+    assert args.output is None
+    assert args.timeout == cli.DEFAULT_TIMEOUT
+
+
 def test_missing_command_exits_usage():
     parser = cli.build_parser()
     with pytest.raises(SystemExit) as excinfo:
@@ -105,6 +113,11 @@ def test_chunks_per_source_requires_query():
 def test_timeout_must_be_positive():
     usage_error(["search", "q", "--timeout", "0"])
     usage_error(["extract", "https://example.com", "--timeout", "-5"])
+    usage_error(["usage", "--timeout", "0"])
+
+
+def test_usage_stdout_and_output_mutually_exclusive():
+    usage_error(["usage", "--stdout", "--output", "x.json"])
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +476,95 @@ def test_emit_payload_stdout(capsys):
     payload = {"command": "search", "input": {}, "data": {"result_count": 1}}
     cli._emit_payload(payload, None)
     assert json.loads(capsys.readouterr().out) == payload
+
+
+# ---------------------------------------------------------------------------
+# usage subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_usage_schema_registered():
+    schema = cli._payload_schema("usage")
+    assert "remaining_credits" in schema["data"]
+    assert "results" not in schema["data"]
+
+
+def test_usage_default_output_path(tmp_path, monkeypatch):
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+    args = parse(["usage"])
+    path = cli._default_output_path(args)
+    assert path.startswith(str(tmp_path))
+    assert "usage_" in path
+
+
+def test_run_usage_success(monkeypatch):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    captured = {}
+
+    def fake_get(url, key, timeout):
+        captured["url"] = url
+        captured["key"] = key
+        captured["timeout"] = timeout
+        return 200, {
+            "success": True,
+            "data": {
+                "remainingCredits": 82340,
+                "planCredits": 100000,
+                "billingPeriodStart": "2026-10-02T04:24:17.000Z",
+                "billingPeriodEnd": "2026-11-02T04:24:17.000Z",
+            },
+        }
+
+    monkeypatch.setattr(cli, "_get_json", fake_get)
+    args = parse(["usage", "--timeout", "15"])
+    code, payload, error = cli.run_usage(args, "fc-test-key")
+
+    assert code == cli.EXIT_OK
+    assert error is None
+    assert captured["url"] == cli.CREDIT_USAGE_URL
+    assert captured["key"] == "fc-test-key"
+    assert captured["timeout"] == 15
+    assert payload["command"] == "usage"
+    assert payload["data"]["remaining_credits"] == 82340
+    assert payload["data"]["plan_credits"] == 100000
+
+
+def test_run_usage_http_error(monkeypatch):
+    monkeypatch.setattr(cli, "_get_json", lambda url, key, timeout: (401, {"error": "unauthorized"}))
+    args = parse(["usage"])
+    code, payload, error = cli.run_usage(args, "fc-bad")
+
+    assert code == cli.EXIT_AUTH
+    assert payload is None
+    assert error["http_status"] == 401
+
+
+def test_run_usage_missing_data(monkeypatch):
+    monkeypatch.setattr(cli, "_get_json", lambda url, key, timeout: (200, {"success": True}))
+    args = parse(["usage"])
+    code, payload, error = cli.run_usage(args, "fc-test-key")
+
+    assert code == cli.EXIT_OK
+    assert payload["data"]["remaining_credits"] is None
+
+
+def test_run_usage_non_dict_data_does_not_crash(monkeypatch):
+    monkeypatch.setattr(cli, "_get_json", lambda url, key, timeout: (200, {"success": True, "data": [1, 2, 3]}))
+    args = parse(["usage"])
+    code, payload, error = cli.run_usage(args, "fc-test-key")
+
+    assert code == cli.EXIT_OK
+    assert payload["data"]["remaining_credits"] is None
+
+
+def test_main_usage_success(capsys, monkeypatch):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setattr(cli, "_get_json", lambda url, key, timeout: (200, {"success": True, "data": {"remainingCredits": 5, "planCredits": 10}}))
+    rc = cli.main(["usage", "--stdout"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["command"] == "usage"
+    assert out["data"]["remaining_credits"] == 5
 
 
 def test_emit_payload_file(capsys, tmp_path):

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 API_BASE = "https://api.firecrawl.dev/v2"
+CREDIT_USAGE_URL = "https://api.firecrawl.dev/v2/team/credit-usage"
 
 DEFAULT_MAX_RESULTS = 6
 DEFAULT_TIMEOUT = 60
@@ -306,6 +307,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include favicon URLs from page metadata when present",
     )
 
+    usage_parser = subparsers.add_parser("usage", help="Show Firecrawl account credit usage")
+    usage_parser.set_defaults(stdout=False)
+    usage_parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Print the full JSON payload to stdout instead of writing it to the default output file",
+    )
+    usage_parser.add_argument(
+        "--output",
+        help="Write the full usage payload to a file and return status JSON on stdout",
+    )
+    usage_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT})",
+    )
+
     return parser
 
 
@@ -327,6 +346,12 @@ def _build_tbs(args: argparse.Namespace) -> str | None:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.command == "usage":
+        if args.timeout <= 0:
+            parser.error("--timeout must be greater than 0.")
+        if args.stdout and args.output:
+            parser.error("Use either --stdout or --output, not both.")
+        return
     if args.command == "extract":
         if args.timeout <= 0:
             parser.error("--timeout must be greater than 0.")
@@ -446,6 +471,38 @@ def _post_json(path: str, body: dict[str, Any], api_key: str, timeout: float) ->
             "Content-Type": "application/json",
         },
         method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if not isinstance(payload, dict):
+            payload = None
+        return status, payload
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError):
+        return None, None
+
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return status, None
+    if not isinstance(payload, dict):
+        return status, None
+    return status, payload
+
+
+def _get_json(url: str, api_key: str, timeout: float) -> tuple[int | None, dict[str, Any] | None]:
+    """GET JSON from the Firecrawl API. Returns (http_status, parsed_body)."""
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        method="GET",
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -647,8 +704,10 @@ def _default_output_path(args: argparse.Namespace) -> str:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.command == "search":
         seed = args.query
-    else:
+    elif args.command == "extract":
         seed = args.urls[0]
+    else:
+        seed = args.command
     slug = _slugify(seed)
     return str(get_default_output_dir() / f"{args.command}_{timestamp}_{slug}.json")
 
@@ -666,6 +725,16 @@ def _payload_schema(command: object) -> dict[str, Any]:
         "command": "string",
         "input": "object",
     }
+    if command == "usage":
+        return {
+            **base,
+            "data": {
+                "remaining_credits": "number|null",
+                "plan_credits": "number|null",
+                "billing_period_start": "string|null",
+                "billing_period_end": "string|null",
+            },
+        }
     if command == "extract":
         return {
             **base,
@@ -811,6 +880,28 @@ def run_extract(
     return EXIT_OK, payload_out, None
 
 
+def run_usage(
+    args: argparse.Namespace, api_key: str
+) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
+    status, payload = _get_json(CREDIT_USAGE_URL, api_key, args.timeout)
+    code = _exit_code_for(status, payload)
+    if code != EXIT_OK:
+        return code, None, {"http_status": status, "error": _error_message(status, payload)}
+
+    raw_data = (payload or {}).get("data")
+    data = raw_data if isinstance(raw_data, dict) else {}
+    return EXIT_OK, {
+        "command": "usage",
+        "input": {"timeout": args.timeout},
+        "data": {
+            "remaining_credits": data.get("remainingCredits"),
+            "plan_credits": data.get("planCredits"),
+            "billing_period_start": data.get("billingPeriodStart"),
+            "billing_period_end": data.get("billingPeriodEnd"),
+        },
+    }, None
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -836,6 +927,8 @@ def main(argv: list[str] | None = None) -> int:
             code, payload, error = run_search(args, api_key)
         elif args.command == "extract":
             code, payload, error = run_extract(args, api_key)
+        elif args.command == "usage":
+            code, payload, error = run_usage(args, api_key)
         else:
             parser.error(f"Unsupported command: {args.command}")
             return EXIT_USAGE

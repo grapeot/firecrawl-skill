@@ -1,8 +1,8 @@
 # firecrawl-skill
 
-Agent-facing web search and URL extraction CLI backed by the [Firecrawl v2 API](https://docs.firecrawl.dev/api-reference/endpoint/search).
+Agent-facing web search, URL extraction, and account credit-usage CLI backed by the [Firecrawl v2 API](https://docs.firecrawl.dev/api-reference/endpoint/search).
 
-The CLI is a drop-in mirror of [tavily-skill](https://github.com/grapeot/tavily-skill): the same subcommands (`search`, `extract`), the same flag names and defaults, the same JSON envelope, and the same file-output behavior. Downstream workflows that consume tavily-skill payloads work unchanged.
+The CLI is a drop-in mirror of [tavily-skill](https://github.com/grapeot/tavily-skill): the same subcommands (`search`, `extract`, `usage`), the same flag names and defaults, the same JSON envelope, and the same file-output behavior. Downstream workflows that consume tavily-skill payloads work unchanged.
 
 ## Quickstart
 
@@ -34,6 +34,9 @@ python -m firecrawl_skill search "AI coding tools" --stdout
 # URL content extraction
 python -m firecrawl_skill extract https://example.com
 python -m firecrawl_skill extract https://example.com --query "agent search"
+
+# Check credit usage (remaining credits, plan size, billing period)
+python -m firecrawl_skill usage --stdout
 ```
 
 ## Configuration
@@ -56,7 +59,24 @@ Web search via `POST /v2/search`. With `--raw-content markdown` (default), every
 
 URL content extraction via `POST /v2/scrape`, one request per URL (1–20 URLs per call). `--query` requests query-relevant highlights for each page.
 
-Full flag reference: `python -m firecrawl_skill search --help` / `extract --help`, or see `skills/skill_firecrawl.md`.
+### `usage`
+
+Account credit usage via `GET /v2/team/credit-usage`. Reports remaining credits, plan size, and the current billing period in the standard envelope:
+
+```json
+{
+  "command": "usage",
+  "input": {"timeout": 60},
+  "data": {
+    "remaining_credits": 82340,
+    "plan_credits": 100000,
+    "billing_period_start": "2026-10-02T04:24:17.000Z",
+    "billing_period_end": "2026-11-02T04:24:17.000Z"
+  }
+}
+```
+
+Full flag reference: `python -m firecrawl_skill search --help` / `extract --help` / `usage --help`, or see `skills/skill_firecrawl.md`.
 
 ## Output
 

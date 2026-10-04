@@ -78,6 +78,17 @@ Upstream: `POST /v2/scrape`, one request per URL, sequential.
 
 Per-URL result shape: `{url, markdown: <upstream data.markdown>, highlights, images, metadata, error: null}`; on failure: `{url, error: <upstream error string or HTTP status>}`. `data.credits_used` is the sum across successful scrapes (upstream `creditsUsed`/`metadata.creditCount` when present).
 
+## API mapping — `usage`
+
+Upstream: `GET /v2/team/credit-usage` (no request body). Reuses the resolved API key and the shared HTTP status → exit-code mapping.
+
+| CLI flag | Firecrawl request field | Notes |
+|---|---|---|
+| `--timeout` (s, default 60) | — | GET request timeout |
+| `--stdout` / `--output` | — | identical semantics to the other subcommands |
+
+`data.remainingCredits` / `data.planCredits` / `data.billingPeriodStart` / `data.billingPeriodEnd` map to `data.remaining_credits` / `data.plan_credits` / `data.billing_period_start` / `data.billing_period_end`. The command consumes no credits and is not part of the credit-estimate stderr output.
+
 ## Validation rules
 
 1. `--include-domain` and `--exclude-domain` are mutually exclusive (search).
@@ -122,7 +133,7 @@ Auto-named under `FIRECRAWL_CLI_OUTPUT_DIR` (default `./tmp/firecrawl/`): `{comm
 
 ## Testing strategy
 
-- **Offline (`tests/test_unit.py`)**: argparse validation matrix (all rules above), ISO → `MM/DD/YYYY` conversion, `tbs` construction, request-body builders (search and extract, every flag combination that matters), envelope normalization from recorded fixtures, exit-code mapping from simulated HTTP responses (transport monkeypatched). No network, no key.
+- **Offline (`tests/test_unit.py`)**: argparse validation matrix (all rules above), ISO → `MM/DD/YYYY` conversion, `tbs` construction, request-body builders (search and extract, every flag combination that matters), envelope normalization from recorded fixtures, `usage` normalization and error mapping (transport monkeypatched), exit-code mapping from simulated HTTP responses. No network, no key.
 - **Live (`tests/test_integration.py`, opt-in via `RUN_FIRECRAWL_INTEGRATION=1`)**: 3–5 real calls (plain search, search + content, `--time-range`, extract with `--query`), asserting `success`, `credits_used` present, `raw_content` non-empty. Consumes a small number of credits.
 
 ## Open items to verify against live responses during implementation

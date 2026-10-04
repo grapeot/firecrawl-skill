@@ -1,6 +1,6 @@
 # Firecrawl Skill
 
-Real-time web search and URL content extraction through the Firecrawl v2 API. The CLI defaults to writing full payloads to local JSON files and returning a lightweight status object on stdout; use `--stdout` when you need the complete JSON inline.
+Real-time web search, URL content extraction, and credit-usage checks through the Firecrawl v2 API. The CLI defaults to writing full payloads to local JSON files and returning a lightweight status object on stdout; use `--stdout` when you need the complete JSON inline.
 
 The command surface and output contract mirror tavily-skill so workflows switch by changing the module name only.
 
@@ -72,6 +72,14 @@ python -m firecrawl_skill extract https://firecrawl.dev --query "agent search" -
 
 `--query` requests query-relevant highlights for each page (Firecrawl returns the relevant passages; there is no chunk-count control).
 
+### Check credit usage
+
+```bash
+python -m firecrawl_skill usage --stdout
+```
+
+Reports remaining credits, plan size, and the current billing period. `usage` is a read-only account query and consumes no credits.
+
 ### Disable images or raw content
 
 ```bash
@@ -137,6 +145,16 @@ Image results carry URLs and dimensions only; `--image-descriptions` is not supp
 | `--stdout` | Print full payload directly to stdout | `False` |
 | `--output` | Write full extract payload to a named JSON file; stdout still returns status schema | auto-writes to `tmp/firecrawl/` or `FIRECRAWL_CLI_OUTPUT_DIR` |
 
+### `usage`
+
+| Parameter | Description | Default |
+|---|---|---|
+| `--stdout` | Print full payload directly to stdout | `False` |
+| `--output` | Write full usage payload to a named JSON file; stdout still returns status schema | auto-writes to `tmp/firecrawl/` or `FIRECRAWL_CLI_OUTPUT_DIR` |
+| `--timeout` | Request timeout in seconds | `60` |
+
+`usage` calls `GET https://api.firecrawl.dev/v2/team/credit-usage` and normalizes `data.remainingCredits` / `data.planCredits` / billing period into the standard envelope. It consumes no credits.
+
 ## Image guidance
 
 Images are off by default. The reason is not that images lack value — it's that most research and survey workflows don't consume `data.images`, and enabling them silently inflates payload size.
@@ -197,7 +215,7 @@ Integration tests hit the real Firecrawl API and consume credits. If `FIRECRAWL_
 - `--time-range` and `--start-date`/`--end-date` are mutually exclusive — use one or the other
 - `--include-domain` and `--exclude-domain` are mutually exclusive (Firecrawl constraint)
 - `--image-descriptions` and `--topic finance` are rejected with a usage error
-- The currently stable commands are `search` and `extract`
+- The currently stable commands are `search`, `extract`, and `usage`
 - `--output` still produces JSON on stdout, but that stdout is the status schema, not the full search result
 - Exit codes: 0 ok / 2 usage / 10 auth / 11 quota-rate / 12 rejected-no-data / 13 network-server
 
