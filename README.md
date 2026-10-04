@@ -108,7 +108,28 @@ The top-level structure is fixed:
 }
 ```
 
-In default mode the full payload is written to an auto-named file and stdout carries a lightweight status object. Use `--stdout` for the full payload inline, or `--output PATH` for a named file. The envelope shape above is the `search`/`extract` contract; `usage` reuses the `{command, input, data}` envelope with its own `data` block — see [`usage`](#usage) above.
+In default mode the full payload is written to an auto-named file and stdout carries a lightweight status object. Use `--stdout` for the full payload inline, or `--output PATH` for a named file.
+
+### Cost breakdown
+
+`search` and `extract` payloads carry a `data.cost_breakdown` object that reconstructs the Firecrawl credit charge per document, so a finished payload explains its own bill:
+
+```json
+{
+  "base": 2,
+  "documents": [
+    {"url": "https://x.com/x/status/1", "kind": "x", "credits": 30},
+    {"url": "https://a/visa.pdf", "kind": "pdf", "pages": 67, "credits": 67},
+    {"url": "https://b.com", "kind": "html", "credits": 1}
+  ],
+  "modelled_total": 100,
+  "reported_total": 100,
+  "reconciles": true,
+  "warning": null
+}
+```
+
+Credit cost is not linear: a plain HTML page is 1 credit, an x.com/twitter.com result is 30 (Grok), and a PDF is 1 credit per page. The breakdown makes that visible after the fact. It is best-effort and never blocks — on any disagreement it fills `warning` and leaves `credits_used` authoritative. The envelope shape above is the `search`/`extract` contract; `usage` reuses the `{command, input, data}` envelope with its own `data` block — see [`usage`](#usage) above.
 
 ## Exit codes
 

@@ -112,6 +112,7 @@ Check `data.remaining_credits` before a batch you expect to be expensive: at ~8 
 - With `--output`, the complete result writes to the specified file; stdout still prints the lightweight status object
 - With `--stdout`, the complete payload prints directly to stdout without writing to disk
 - `credits_used` in `data` records the actual Firecrawl credits consumed (from the API response)
+- `data.cost_breakdown` explains that number per document (HTML 1, x.com/twitter 30, PDF 1/page, unreturned 0); best-effort, non-blocking, with a `warning` on mismatch
 - `usage` is the exception to the estimates above: it costs 0 credits and prints no `Estimated Firecrawl credits:` line
 
 ## Parameter reference
@@ -200,6 +201,8 @@ The top-level structure is fixed:
 ```
 
 `search`'s `data.results` retains one item per web result with `url`, `title`, `description`, `position`, `raw_content` (markdown when requested, `null` otherwise), optional `links` and `metadata`. News items also land in `data.news`; with `--topic news` they are merged into `data.results` as well. For `extract`, `data.results` holds one item per URL (`markdown`, optional `highlights`/`images`/`metadata`) and additionally carries `failed_results` and `failed_count`.
+
+Both commands also carry `data.cost_breakdown`, which reconstructs the credit charge per document (`base`, `documents[]` with `kind`/`credits`, `modelled_total`, `reported_total`, `reconciles`, `warning`). Credit cost is not linear — HTML is 1 credit, x.com/twitter.com is 30 (Grok), PDFs are 1 credit/page, and an unreturned document is 0 — so this field explains a finished payload's bill. It is best-effort and never blocks: on disagreement it sets `reconciles: false` and fills `warning`, while `credits_used` stays authoritative.
 
 For `usage`, `data` carries the balance instead of results:
 

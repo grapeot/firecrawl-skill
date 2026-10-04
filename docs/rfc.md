@@ -127,6 +127,39 @@ Field-name drift on the historical endpoint: the OpenAPI response schema names t
 - `raw` keeps the full upstream body/ies (`raw.credit_usage`, plus `raw.credit_usage_historical` when fetched). This is a deliberate exception to D2 — the tavily-skill "no `raw` passthrough" rule exists because search payloads are megabytes; a billing body is ~165 bytes, and verbatim upstream text is what makes the normalized fields auditable.
 - Status-object summary carries `remaining_credits` alongside the existing keys on every command (`null` for search/extract) so consumers read one summary shape.
 
+## Cost breakdown (observability) — `cost_breakdown`
+
+Firecrawl search is `base + per-document`; the per-document cost is not linear. The upstream `creditsUsed` is authoritative, but it does not say *why*. Every `search`/`extract` payload therefore carries a `data.cost_breakdown` object that reconstructs the charge so a finished payload can be audited after the fact:
+
+```json
+{
+  "base": 2,
+  "documents": [
+    {"url": "https://x.com/x/status/1", "kind": "x", "credits": 30},
+    {"url": "https://a/visa.pdf", "kind": "pdf", "pages": 67, "credits": 67},
+    {"url": "https://b.com", "kind": "html", "credits": 1},
+    {"url": "https://x.com/x/all", "kind": "x", "credits": 0}
+  ],
+  "modelled_total": 100,
+  "reported_total": 100,
+  "reconciles": true,
+  "warning": null
+}
+```
+
+Rules (verified against 212 recorded `search` calls and 164 `extract` calls from 2026-10; all reconcile exactly):
+
+- `base` = `2 × ceil(result_count / 10)`. It keys off **results actually returned**, not `--max-results`: a query that matches nothing bills 0.
+- A document that was **not returned** (no `raw_content` for search / no `markdown` for extract, e.g. an `x.com/.../all` list page) bills **0**.
+- A returned **plain HTML** document bills **1** (`metadata.creditsUsed` when present, else 1).
+- An **x.com / twitter.com** document bills **30** (`creditsUsed: 30`; 1 base + 29 Grok).
+- A **PDF** document bills **1 × `metadata.numPages`** (the page count is copied into `pages`).
+- `--query` on extract adds 4/page (`highlights`); the upstream per-page `creditsUsed` already folds this in, so it is read directly, not re-derived.
+
+Host matching for the X/Twitter rule normalizes case and FQDN trailing dots and requires an exact-or-subdomain match, so `evilx.com`, `x.com.evil.com`, `notx.com`, and `x.com.cn` do **not** qualify. JSON booleans are rejected from billing arithmetic (a `true` credit field is not read as 1).
+
+`cost_breakdown` is best-effort and **never blocks**. When `modelled_total != reported_total` it sets `reconciles: false` and fills `warning` with a human-readable sentence naming both figures; the command still succeeds and all other fields are unaffected. `credits_used` remains the source of truth. When the API returns no total, `reconciles` is `null` and no warning is emitted (nothing to reconcile against).
+
 ## Exit codes and HTTP mapping
 
 | HTTP / condition | Exit code |
@@ -162,7 +195,7 @@ Auto-named under `FIRECRAWL_CLI_OUTPUT_DIR` (default `./tmp/firecrawl/`): `{comm
 
 ## Testing strategy
 
-- **Offline (`tests/test_unit.py`)**: argparse validation matrix (all rules above), ISO → `MM/DD/YYYY` conversion, `tbs` construction, request-body builders (search and extract, every flag combination that matters), envelope normalization from recorded fixtures, exit-code mapping from simulated HTTP responses (transport monkeypatched). No network, no key.
+- **Offline (`tests/test_unit.py`)**: argparse validation matrix (all rules above), ISO → `MM/DD/YYYY` conversion, `tbs` construction, request-body builders (search and extract, every flag combination that matters), envelope normalization from recorded fixtures, `cost_breakdown` reconstruction (base math, HTML/PDF/X/zero-doc classification, mismatch warning, absent-total), exit-code mapping from simulated HTTP responses (transport monkeypatched). No network, no key.
 - **Live (`tests/test_integration.py`, opt-in via `RUN_FIRECRAWL_INTEGRATION=1`)**: 3–5 real calls (plain search, search + content, `--time-range`, extract with `--query`), asserting `success`, `credits_used` present, `raw_content` non-empty. Consumes a small number of credits. The `usage` live test adds one read-only billing call (0 credits) asserting `remaining_credits`/`plan_credits` are ints and `raw.credit_usage` agrees with the normalized fields; it skips when no key resolves.
 
 ## Open items to verify against live responses during implementation

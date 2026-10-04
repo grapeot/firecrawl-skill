@@ -308,6 +308,140 @@ def test_normalize_search_image_count():
 
 
 # ---------------------------------------------------------------------------
+# Cost breakdown (observability)
+# ---------------------------------------------------------------------------
+
+
+def test_base_search_credits():
+    assert cli._base_search_credits(0) == 0
+    assert cli._base_search_credits(1) == 2
+    assert cli._base_search_credits(10) == 2
+    assert cli._base_search_credits(11) == 4
+    assert cli._base_search_credits(20) == 4
+
+
+def test_as_int_rejects_bool_and_strings():
+    assert cli._as_int(30) == 30
+    assert cli._as_int(1.9) == 1
+    assert cli._as_int(True) is None
+    assert cli._as_int(False) is None
+    assert cli._as_int("30") is None
+    assert cli._as_int(None) is None
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://x.com/foo", "x"),
+        ("https://x.com./foo", "x"),          # FQDN trailing dot
+        ("https://X.COM/foo", "x"),            # case
+        ("https://mobile.twitter.com/a", "x"),
+        ("https://x.com:8443/a", "x"),         # port
+        ("https://user@x.com/a", "x"),         # userinfo
+        ("https://evilx.com/a", "html"),       # must NOT match x.com
+        ("https://x.com.evil.com/a", "html"),  # must NOT match x.com
+        ("https://notx.com/a", "html"),
+        ("https://x.com.cn/a", "html"),
+        ("not a url", "html"),
+        (None, "html"),
+    ],
+)
+def test_document_kind_host_matching(url, expected):
+    assert cli._document_kind(url, {"contentType": "text/html"}) == expected
+
+
+def test_document_cost_bool_credits_ignored():
+    # upstream JSON true must not be read as a 1-credit figure
+    kind, credits, _ = cli._document_cost("https://x.com/a", {"creditsUsed": True}, None)
+    assert kind == "x" and credits == 30
+
+
+def test_search_cost_breakdown_plain_html():
+    # 2 HTML docs, upstream reported 2 (base) + 1 + 1 = 4
+    results = [
+        {"url": "https://a.com", "raw_content": "x", "metadata": {"contentType": "text/html", "creditsUsed": 1}},
+        {"url": "https://b.com", "raw_content": "y", "metadata": {"contentType": "text/html", "creditsUsed": 1}},
+    ]
+    cb = cli._build_cost_breakdown(
+        cli._base_search_credits(len(results)), cli._cost_documents(results, "raw_content"), 4
+    )
+    assert cb["base"] == 2
+    assert [d["kind"] for d in cb["documents"]] == ["html", "html"]
+    assert cb["modelled_total"] == 4
+    assert cb["reconciles"] is True
+    assert cb["warning"] is None
+
+
+def test_search_cost_breakdown_pdf_billed_per_page():
+    results = [
+        {"url": "https://x/visa.pdf", "raw_content": "p", "metadata": {"contentType": "application/pdf", "numPages": 67, "creditsUsed": 67}},
+        {"url": "https://x/a.html", "raw_content": "h", "metadata": {"contentType": "text/html; charset=utf-8", "creditsUsed": 1}},
+    ]
+    cb = cli._build_cost_breakdown(cli._base_search_credits(len(results)), cli._cost_documents(results, "raw_content"), 70)
+    assert cb["documents"][0]["kind"] == "pdf"
+    assert cb["documents"][0]["pages"] == 67
+    assert cb["modelled_total"] == 2 + 67 + 1
+    assert cb["reconciles"] is True
+
+
+def test_search_cost_breakdown_x_grok():
+    results = [
+        {"url": "https://x.com/foo/status/1", "raw_content": "s", "metadata": {"creditsUsed": 30}},
+        {"url": "https://twitter.com/bar", "raw_content": "s", "metadata": {"creditsUsed": 30}},
+        {"url": "https://x.com/foo/all", "metadata": {}},  # list page, no document -> 0
+    ]
+    cb = cli._build_cost_breakdown(cli._base_search_credits(len(results)), cli._cost_documents(results, "raw_content"), 62)
+    assert [d["kind"] for d in cb["documents"]] == ["x", "x", "x"]
+    assert [d["credits"] for d in cb["documents"]] == [30, 30, 0]
+    assert cb["modelled_total"] == 62
+    assert cb["reconciles"] is True
+
+
+def test_search_cost_breakdown_no_document_is_zero():
+    results = [{"url": "https://x.com/foo/all", "metadata": {"viewport": "x"}}]  # metadata but no doc
+    cb = cli._build_cost_breakdown(cli._base_search_credits(len(results)), cli._cost_documents(results, "raw_content"), 2)
+    assert cb["documents"][0]["credits"] == 0
+    assert cb["modelled_total"] == 2
+    assert cb["reconciles"] is True
+
+
+def test_search_cost_breakdown_mismatch_warns_not_blocks():
+    results = [{"url": "https://a.com", "raw_content": "x", "metadata": {"contentType": "text/html", "creditsUsed": 1}}]
+    cb = cli._build_cost_breakdown(cli._base_search_credits(len(results)), cli._cost_documents(results, "raw_content"), 999)
+    assert cb["reconciles"] is False
+    assert cb["reported_total"] == 999
+    assert isinstance(cb["warning"], str) and "999" in cb["warning"]
+
+
+def test_search_cost_breakdown_no_reported_total():
+    results = [{"url": "https://a.com", "raw_content": "x", "metadata": {"contentType": "text/html"}}]
+    cb = cli._build_cost_breakdown(cli._base_search_credits(len(results)), cli._cost_documents(results, "raw_content"), None)
+    assert cb["reported_total"] is None
+    assert cb["reconciles"] is None
+    assert cb["warning"] is None
+
+
+def test_normalize_search_includes_cost_breakdown(search_with_content_fixture):
+    args = parse(["search", "firecrawl web scraping", "--max-results", "2"])
+    out = cli._normalize_search_response(args, search_with_content_fixture)
+    cb = out["data"]["cost_breakdown"]
+    assert cb["reported_total"] == search_with_content_fixture["creditsUsed"]
+    assert cb["reconciles"] is True
+
+
+def test_extract_cost_documents():
+    results = [
+        {"url": "https://a.com", "markdown": "x", "metadata": {"contentType": "text/html", "creditsUsed": 5}},  # highlights +4
+        {"url": "https://x/b.pdf", "markdown": "y", "metadata": {"contentType": "application/pdf", "numPages": 32, "creditsUsed": 32}},
+    ]
+    docs = cli._cost_documents(results, "markdown")
+    assert docs[0]["credits"] == 5
+    assert docs[1]["kind"] == "pdf" and docs[1]["pages"] == 32
+    cb = cli._build_cost_breakdown(0, docs, 37)
+    assert cb["reconciles"] is True
+
+
+# ---------------------------------------------------------------------------
 # Normalization (extract)
 # ---------------------------------------------------------------------------
 
