@@ -23,6 +23,12 @@ python -m firecrawl_skill search "latest AI news" --time-range week
 # search with result count and time range
 python -m firecrawl_skill search "openai releases" --max-results 10 --time-range month
 
+# many independent queries in one process, run in parallel (4 at a time by default)
+python -m firecrawl_skill search \
+  --query "latest AI news" \
+  --query "openai releases" \
+  --query "anthropic news"
+
 # restrict to specific domains
 python -m firecrawl_skill search "agent framework" \
   --include-domain github.com \
@@ -57,6 +63,35 @@ A local `.env` file in the working directory (or any parent directory) is loaded
 ### `search`
 
 Web search via `POST /v2/search`. With `--raw-content markdown` (default), every result includes full-page markdown, which costs 1 additional Firecrawl credit per page on top of 2 credits per 10 results.
+
+A single query is the positional form: `search "some query"`. An agent that needs many independent queries can launch them all in one process with the repeatable `--query` option — each `--query` is one complete query string (multi-word queries are never split):
+
+```bash
+python -m firecrawl_skill search --query "q1" --query "q2" --query "q3"
+```
+
+Batch mode runs the queries in parallel with `concurrent.futures.ThreadPoolExecutor` (no new dependencies), at `--concurrency N` workers (default 4) or sequentially with `--serial`. `--serial` wins over `--concurrency` and is equivalent to `--concurrency 1`. The positional query and `--query` are mutually exclusive; giving both, or neither, is a usage error (exit 2). `--output` and `--stdout` apply to single-query mode only and are usage errors in batch mode.
+
+Batch mode preserves the one-query-one-file corpus invariant: each query writes its own full-payload JSON file under `FIRECRAWL_CLI_OUTPUT_DIR` (or `./tmp/firecrawl/`), auto-named `search_{timestamp}_{slug}.json` with an index suffix on slug collision. Stdout carries exactly one batch status object — one entry per query plus aggregate counts and summed credits:
+
+```json
+{
+  "command": "search",
+  "status": "partial",
+  "output_mode": "batch",
+  "output_dir": "/path/to/output",
+  "input": { "queries": ["q1", "q2", "q3"], "concurrency": 4, "serial": false, "...": "shared search flags" },
+  "summary": { "query_count": 3, "success_count": 2, "failed_count": 1, "credits_used": 16 },
+  "results": [
+    { "query": "q1", "output_path": "/path/to/output/search_..._q1.json", "summary": { "result_count": 6, "credits_used": 8 }, "error": null },
+    { "query": "q2", "output_path": "/path/to/output/search_..._q2.json", "summary": { "result_count": 6, "credits_used": 8 }, "error": null },
+    { "query": "q3", "output_path": null, "summary": null, "error": { "http_status": 500, "error": "HTTP 500" } }
+  ],
+  "payload_schema": { "...": "one entry per envelope field, mirroring the single-mode convention" }
+}
+```
+
+`status` is `ok` when every query succeeds, `partial` when some fail, and `error` when all fail. A partial failure still exits 0, with each failed query reported in the status and a `Warning:` line on stderr, exactly like `extract`'s partial failure; only the all-failed `error` case exits with the first failure's mapped code (10/11/12/13). Batch credits sum only the successful queries — in the example above the two successes contribute 8 + 8 = 16, and the failed query adds nothing. The batch status object is lightweight (no raw content inline) and carries a `payload_schema` hint; full result content lives in the per-query files.
 
 ### `extract`
 
@@ -143,6 +178,8 @@ Credit cost is not linear: a plain HTML page is 1 credit, an x.com/twitter.com r
 | 13 | Timeout or server error (408/5xx/network) |
 
 The mapping is identical for `usage`: a documented `404 Could not find credit usage information` maps to 12, an unreachable or 5xx billing endpoint to 13.
+
+`search` batch mode is the one case where exit 0 also covers partial failure: when some `--query` values fail and at least one succeeds, the command exits 0 and the failures are reported per query in the status object (plus a stderr warning). If every query fails, the exit code is the first failure's mapped value.
 
 ## Credit accounting
 

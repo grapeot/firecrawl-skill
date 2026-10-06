@@ -1,4 +1,4 @@
-from firecrawl_skill.cli import main
+from firecrawl_skill.cli import _cli_exit, main
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _cli_exit(main())

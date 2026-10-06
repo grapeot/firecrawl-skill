@@ -8,6 +8,7 @@ tavily-skill; see docs/rfc.md.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import json
 import math
@@ -31,6 +32,7 @@ DEFAULT_TOPIC = "general"
 DEFAULT_SEARCH_DEPTH = "advanced"
 DEFAULT_EXTRACT_DEPTH = "advanced"
 DEFAULT_EXTRACT_FORMAT = "markdown"
+DEFAULT_CONCURRENCY = 4
 MAX_RESULTS_LIMIT = 20
 MAX_URLS_LIMIT = 20
 MAX_USAGE_PERIODS = 100
@@ -166,7 +168,33 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     search_parser = subparsers.add_parser("search", help="Search the web with Firecrawl")
-    search_parser.add_argument("query", help="Search query")
+    search_parser.add_argument(
+        "query",
+        nargs="?",
+        help="Search query (single-query mode; mutually exclusive with --query)",
+    )
+    search_parser.add_argument(
+        "--query",
+        dest="queries",
+        action="append",
+        default=[],
+        metavar="QUERY",
+        help=(
+            "One complete query string; repeat for a multi-query batch executed "
+            "in parallel (mutually exclusive with the positional query)"
+        ),
+    )
+    search_parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        help=f"Batch mode: parallel queries (default: {DEFAULT_CONCURRENCY})",
+    )
+    search_parser.add_argument(
+        "--serial",
+        action="store_true",
+        help="Batch mode: force sequential execution (equivalent to --concurrency 1; overrides --concurrency)",
+    )
     search_parser.add_argument(
         "--max-results",
         type=int,
@@ -387,6 +415,23 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             parser.error("--chunks-per-source requires --query.")
         return
 
+    has_positional_query = args.query is not None
+    has_batch_queries = bool(args.queries)
+    if has_positional_query and has_batch_queries:
+        parser.error("Provide either a positional query or --query, not both.")
+    if not has_positional_query and not has_batch_queries:
+        parser.error("Provide a search query: a positional query, or one or more --query values.")
+    if has_positional_query and not args.query.strip():
+        parser.error("Search query must not be empty.")
+    if has_batch_queries and any(not query.strip() for query in args.queries):
+        parser.error("--query values must not be empty.")
+    if args.concurrency < 1:
+        parser.error("--concurrency must be at least 1.")
+    if has_batch_queries and args.stdout:
+        parser.error("--stdout is not valid in batch mode; batch mode always writes one file per query.")
+    if has_batch_queries and args.output:
+        parser.error("--output is not valid in batch mode; batch mode always writes one file per query.")
+
     if args.time_range and (args.start_date or args.end_date):
         parser.error("Use either --time-range or --start-date/--end-date, not both.")
     if bool(args.start_date) != bool(args.end_date):
@@ -426,6 +471,18 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
 
 def _normalize_domain(domain: str) -> str:
     return domain.lower().split("://", 1)[-1].split("/", 1)[0]
+
+
+def _is_batch(args: argparse.Namespace) -> bool:
+    """Batch mode is selected solely by one or more `--query` values."""
+    return bool(getattr(args, "queries", None))
+
+
+def _with_query(args: argparse.Namespace, query: str) -> argparse.Namespace:
+    """Per-query copy so parallel workers never share a mutable `query` field."""
+    local = argparse.Namespace(**vars(args))
+    local.query = query
+    return local
 
 
 def _build_search_request(args: argparse.Namespace) -> dict[str, Any]:
@@ -905,31 +962,42 @@ def _normalize_usage_response(
 # ---------------------------------------------------------------------------
 
 
-def _emit_payload(payload: dict[str, Any], output_path: str | None) -> None:
+def _payload_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    """The lightweight per-payload summary shared by single- and batch-mode status objects."""
+    data = payload.get("data", {})
+    return {
+        "result_count": data.get("result_count"),
+        "failed_count": data.get("failed_count"),
+        "image_count": data.get("image_count"),
+        "credits_used": data.get("credits_used"),
+        "remaining_credits": data.get("remaining_credits"),
+    }
+
+
+def _write_payload_file(payload: dict[str, Any], target: Path) -> int:
+    """Write the full payload as pretty JSON; returns the UTF-8 byte length."""
     text = json.dumps(payload, ensure_ascii=False, indent=2)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return len(text.encode("utf-8"))
+
+
+def _emit_payload(payload: dict[str, Any], output_path: str | None) -> None:
     if not output_path:
-        print(text)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
     target = Path(output_path).expanduser()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(text, encoding="utf-8")
+    payload_bytes = _write_payload_file(payload, target)
 
     command = payload.get("command")
-    data = payload.get("data", {})
     status_payload = {
         "command": command,
         "status": "ok",
         "output_mode": "file",
         "output_path": str(target),
-        "payload_bytes": len(text.encode("utf-8")),
-        "summary": {
-            "result_count": data.get("result_count"),
-            "failed_count": data.get("failed_count"),
-            "image_count": data.get("image_count"),
-            "credits_used": data.get("credits_used"),
-            "remaining_credits": data.get("remaining_credits"),
-        },
+        "payload_bytes": payload_bytes,
+        "summary": _payload_summary(payload),
         "payload_schema": _payload_schema(command),
     }
     print(json.dumps(status_payload, ensure_ascii=False, indent=2))
@@ -961,6 +1029,29 @@ def _resolve_output_path(args: argparse.Namespace) -> str | None:
     if getattr(args, "output", None):
         return args.output
     return _default_output_path(args)
+
+
+def _batch_output_paths(queries: list[str]) -> list[str]:
+    """One output path per query under the default output dir.
+
+    Shares the `{command}_{timestamp}_{slug}.json` scheme with single mode. One batch
+    shares a timestamp; a slug collision (two queries reducing to the same slug, or an
+    existing corpus file) appends an index so every query keeps its own file.
+    """
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = get_default_output_dir()
+    used: set[str] = set()
+    paths: list[str] = []
+    for query in queries:
+        base = f"search_{timestamp}_{_slugify(query)}"
+        candidate = f"{base}.json"
+        suffix = 1
+        while candidate in used or (out_dir / candidate).exists():
+            candidate = f"{base}_{suffix}.json"
+            suffix += 1
+        used.add(candidate)
+        paths.append(str(out_dir / candidate))
+    return paths
 
 
 def _payload_schema(command: object) -> dict[str, Any]:
@@ -1011,6 +1102,48 @@ def _payload_schema(command: object) -> dict[str, Any]:
     }
 
 
+def _batch_payload_schema() -> dict[str, Any]:
+    """Schema hint for the `search` batch status envelope (mirrors the single-mode convention)."""
+    return {
+        "command": "string",
+        "status": "string",
+        "output_mode": "string",
+        "output_dir": "string",
+        "input": {
+            "queries": "array",
+            "concurrency": "number",
+            "serial": "boolean",
+            "max_results": "number",
+            "search_depth": "string",
+            "topic": "string",
+            "time_range": "string|null",
+            "start_date": "string|null",
+            "end_date": "string|null",
+            "include_domains": "array",
+            "exclude_domains": "array",
+            "include_images": "boolean",
+            "raw_content": "string",
+            "country": "string|null",
+            "timeout": "number",
+        },
+        "summary": {
+            "query_count": "number",
+            "success_count": "number",
+            "failed_count": "number",
+            "credits_used": "number|null",
+        },
+        "results": [
+            {
+                "query": "string",
+                "output_path": "string|null",
+                "summary": "object|null",
+                "error": "object|null",
+            }
+        ],
+    }
+
+
+
 def _estimate_search_credits(args: argparse.Namespace) -> int:
     search_credits = 2 * math.ceil(args.max_results / 10)
     scrape_credits = args.max_results if args.raw_content != "off" else 0
@@ -1037,10 +1170,7 @@ def _print_credit_estimate(command: str, estimate: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_search(
-    args: argparse.Namespace, api_key: str
-) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
-    _print_credit_estimate("search", _estimate_search_credits(args))
+def _print_search_notes(args: argparse.Namespace) -> None:
     if args.search_depth:
         print(
             f"Note: --search-depth {args.search_depth!r} is ignored (Firecrawl has a single search mode).",
@@ -1051,12 +1181,138 @@ def run_search(
             "Note: --raw-content text maps to markdown (Firecrawl has no text tier).",
             file=sys.stderr,
         )
-    request = _build_search_request(args)
-    status, payload = _post_json("/search", request, api_key, args.timeout)
+
+
+def _run_single_search(
+    args: argparse.Namespace, query: str, api_key: str
+) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
+    local = _with_query(args, query)
+    request = _build_search_request(local)
+    status, payload = _post_json("/search", request, api_key, local.timeout)
     code = _exit_code_for(status, payload)
     if code != EXIT_OK:
         return code, None, {"http_status": status, "error": _error_message(status, payload)}
-    return EXIT_OK, _normalize_search_response(args, payload or {}), None
+    return EXIT_OK, _normalize_search_response(local, payload or {}), None
+
+
+def run_search(
+    args: argparse.Namespace, api_key: str
+) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
+    if _is_batch(args):
+        return run_search_batch(args, api_key)
+    _print_credit_estimate("search", _estimate_search_credits(args))
+    _print_search_notes(args)
+    return _run_single_search(args, args.query, api_key)
+
+
+def run_search_batch(
+    args: argparse.Namespace, api_key: str
+) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
+    """Run one query per `--query` value, in parallel by default.
+
+    Each query gets its own full-payload file, preserving the one-query-one-file corpus
+    invariant. The returned status object is the only thing printed to stdout: one
+    entry per query plus aggregate counts and summed credits. The exit code is 0 when
+    at least one query succeeds (partial failure included); when every query fails it
+    is the first failure's mapped code, mirroring `extract`'s all-failed behavior.
+    """
+    queries = args.queries
+    per_query = _estimate_search_credits(args)
+    print(f"Estimated Firecrawl credits: {per_query * len(queries)}", file=sys.stderr)
+    _print_search_notes(args)
+
+    concurrency = 1 if args.serial else args.concurrency
+    paths = _batch_output_paths(queries)
+
+    def work(index: int) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
+        try:
+            return _run_single_search(args, queries[index], api_key)
+        except Exception as exc:  # one bad query must never abort the batch
+            return EXIT_REJECTED, None, {"http_status": None, "error": f"unexpected error: {exc}"}
+
+    outcomes: list[tuple[int, dict[str, Any] | None, dict[str, Any] | None] | None] = [None] * len(queries)
+    if concurrency <= 1:
+        for index in range(len(queries)):
+            outcomes[index] = work(index)
+    else:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+        completed = False
+        try:
+            future_to_index = {executor.submit(work, index): index for index in range(len(queries))}
+            for future in concurrent.futures.as_completed(future_to_index):
+                outcomes[future_to_index[future]] = future.result()
+            completed = True
+        finally:
+            # On Ctrl-C, stop waiting for in-flight requests and drop pending ones so the
+            # interrupt returns promptly instead of blocking in shutdown(wait=True).
+            executor.shutdown(wait=completed, cancel_futures=not completed)
+
+    entries: list[dict[str, Any]] = []
+    success_count = 0
+    credits_total = 0
+    has_credits = False
+    first_error: tuple[int, dict[str, Any]] | None = None
+
+    for index, outcome in enumerate(outcomes):
+        code, payload, error = outcome or (EXIT_REJECTED, None, None)
+        if code == EXIT_OK and payload is not None:
+            target = Path(paths[index])
+            _write_payload_file(payload, target)
+            summary = _payload_summary(payload)
+            entries.append(
+                {"query": queries[index], "output_path": str(target), "summary": summary, "error": None}
+            )
+            success_count += 1
+            credits = summary.get("credits_used")
+            if isinstance(credits, (int, float)) and not isinstance(credits, bool):
+                credits_total += credits
+                has_credits = True
+        else:
+            failure = error or {"http_status": None, "error": "request failed"}
+            entries.append(
+                {"query": queries[index], "output_path": None, "summary": None, "error": failure}
+            )
+            print(f"Warning: search failed for {queries[index]!r}: {failure.get('error')}", file=sys.stderr)
+            if first_error is None:
+                first_error = (code, failure)
+
+    failed_count = len(queries) - success_count
+    batch_status: dict[str, Any] = {
+        "command": "search",
+        "status": "ok" if failed_count == 0 else ("error" if success_count == 0 else "partial"),
+        "output_mode": "batch",
+        "output_dir": str(get_default_output_dir()),
+        "input": {
+            "queries": queries,
+            "concurrency": concurrency,
+            "serial": bool(args.serial),
+            "max_results": args.max_results,
+            "search_depth": args.search_depth or DEFAULT_SEARCH_DEPTH,
+            "topic": args.topic,
+            "time_range": args.time_range,
+            "start_date": args.start_date,
+            "end_date": args.end_date,
+            "include_domains": args.include_domains,
+            "exclude_domains": args.exclude_domains,
+            "include_images": args.include_images,
+            "raw_content": args.raw_content,
+            "country": args.country,
+            "timeout": args.timeout,
+        },
+        "summary": {
+            "query_count": len(queries),
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "credits_used": credits_total if has_credits else None,
+        },
+        "results": entries,
+        "payload_schema": _batch_payload_schema(),
+    }
+
+    if success_count == 0:
+        code, failure = first_error or (EXIT_REJECTED, {"http_status": None, "error": "all queries failed"})
+        return code, batch_status, failure
+    return EXIT_OK, batch_status, None
 
 
 def run_extract(
@@ -1215,6 +1471,14 @@ def main(argv: list[str] | None = None) -> int:
         print("Interrupted", file=sys.stderr)
         return 130
 
+    if args.command == "search" and _is_batch(args):
+        # Batch mode always prints the status envelope; on total failure the mapped
+        # error also goes to stderr and becomes the exit code.
+        _emit_payload(payload, None)
+        if code != EXIT_OK:
+            _report_failure("search", code, error or {"http_status": None, "error": "all queries failed"})
+        return code
+
     if code != EXIT_OK:
         _report_failure(args.command, code, error or {"http_status": None, "error": "request failed"})
         return code
@@ -1223,5 +1487,20 @@ def main(argv: list[str] | None = None) -> int:
     return EXIT_OK
 
 
+def _cli_exit(code: int) -> None:
+    """Terminate the `__main__` entry points with `code`.
+
+    A Ctrl-C during a parallel batch makes `main` return 130, but CPython still joins
+    the executor's non-daemon worker threads at interpreter exit, so a plain
+    `SystemExit(130)` would wait for in-flight requests to finish. On an interrupt we
+    flush output and terminate immediately instead: the user asked to stop.
+    """
+    if code == 130:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        return os._exit(130)
+    raise SystemExit(code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _cli_exit(main())
