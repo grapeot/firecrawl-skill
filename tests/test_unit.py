@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -1102,3 +1103,202 @@ def test_main_usage_never_touches_post_transport(monkeypatch, tmp_path, credit_u
 
 def unexpected_post(path, body, key, timeout):
     raise AssertionError("usage must use GET transport, not POST")
+
+
+# ---------------------------------------------------------------------------
+# search: multi-query batch mode
+# ---------------------------------------------------------------------------
+
+
+def test_search_positional_query_is_single_mode():
+    args = parse(["search", "hello world"])
+    assert args.query == "hello world"
+    assert args.queries == []
+    assert cli._is_batch(args) is False
+
+
+def test_search_query_option_is_batch_mode():
+    args = parse(["search", "--query", "q1"])
+    assert args.query is None
+    assert args.queries == ["q1"]
+    assert cli._is_batch(args) is True
+
+
+def test_search_query_option_keeps_multiword_query_intact():
+    args = parse(["search", "--query", "one two three"])
+    assert args.queries == ["one two three"]
+    assert cli._build_search_request(cli._with_query(args, args.queries[0]))["query"] == "one two three"
+
+
+def test_search_query_batch_defaults():
+    args = parse(["search", "--query", "q1", "--query", "q2"])
+    assert args.queries == ["q1", "q2"]
+    assert args.concurrency == cli.DEFAULT_CONCURRENCY
+    assert args.serial is False
+
+
+def test_search_positional_and_query_mutually_exclusive():
+    usage_error(["search", "positional", "--query", "batch"])
+
+
+def test_search_requires_a_query():
+    usage_error(["search"])
+    usage_error(["search", "--max-results", "3"])
+
+
+def test_search_batch_rejects_output():
+    usage_error(["search", "--query", "q", "--output", "x.json"])
+
+
+def test_search_batch_rejects_stdout():
+    usage_error(["search", "--query", "q", "--stdout"])
+
+
+def test_search_concurrency_must_be_positive():
+    usage_error(["search", "--query", "q", "--concurrency", "0"])
+    usage_error(["search", "--query", "q", "--concurrency", "-1"])
+
+
+def test_search_batch_writes_one_file_per_query(capsys, monkeypatch, tmp_path, search_with_content_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, search_with_content_fixture))
+
+    rc = cli.main(["search", "--query", "alpha", "--query", "beta", "--query", "gamma"])
+    assert rc == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["command"] == "search"
+    assert status["output_mode"] == "batch"
+    assert status["summary"] == {
+        "query_count": 3,
+        "success_count": 3,
+        "failed_count": 0,
+        "credits_used": 3 * search_with_content_fixture["creditsUsed"],
+    }
+    assert [entry["query"] for entry in status["results"]] == ["alpha", "beta", "gamma"]
+    paths = [entry["output_path"] for entry in status["results"]]
+    assert len(set(paths)) == 3
+    for entry in status["results"]:
+        assert entry["error"] is None
+        assert entry["summary"]["result_count"] == 2
+        written = json.loads(Path(entry["output_path"]).read_text())
+        assert written["command"] == "search"
+        assert written["input"]["query"] == entry["query"]
+        assert written["data"]["results"][0]["raw_content"]
+
+
+def test_search_batch_single_query_value_is_still_batch(capsys, monkeypatch, tmp_path, search_with_content_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, search_with_content_fixture))
+
+    rc = cli.main(["search", "--query", "solo"])
+    assert rc == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["output_mode"] == "batch"
+    assert len(status["results"]) == 1
+
+
+def test_search_batch_autonames_unique_files_for_colliding_slugs(
+    capsys, monkeypatch, tmp_path, search_with_content_fixture
+):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, search_with_content_fixture))
+
+    # "a-b" and "a b" slugify to the same value; the second must get an index suffix.
+    rc = cli.main(["search", "--query", "a-b", "--query", "a b"])
+    assert rc == 0
+    status = json.loads(capsys.readouterr().out)
+    paths = [entry["output_path"] for entry in status["results"]]
+    assert len(set(paths)) == 2
+    assert all(Path(p).exists() for p in paths)
+
+
+def test_search_batch_partial_failure(capsys, monkeypatch, tmp_path, search_with_content_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+
+    def fake_post(path, body, key, timeout):
+        if body["query"] == "bad":
+            return 500, None
+        return 200, search_with_content_fixture
+
+    monkeypatch.setattr(cli, "_post_json", fake_post)
+    rc = cli.main(["search", "--query", "good", "--query", "bad", "--query", "also-good"])
+    assert rc == 0  # partial failure is a success exit
+    captured = capsys.readouterr()
+    status = json.loads(captured.out)
+    assert status["status"] == "partial"
+    assert status["summary"]["success_count"] == 2
+    assert status["summary"]["failed_count"] == 1
+    assert status["summary"]["credits_used"] == 2 * search_with_content_fixture["creditsUsed"]
+    bad = next(entry for entry in status["results"] if entry["query"] == "bad")
+    assert bad["output_path"] is None
+    assert bad["summary"] is None
+    assert bad["error"]["http_status"] == 500
+    assert "Warning" in captured.err
+    assert "bad" in captured.err
+
+
+def test_search_batch_all_fail_returns_mapped_code(capsys, monkeypatch, tmp_path):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (429, {"error": "credits exhausted"}))
+
+    rc = cli.main(["search", "--query", "a", "--query", "b"])
+    assert rc == cli.EXIT_QUOTA_RATE
+    captured = capsys.readouterr()
+    status = json.loads(captured.out)
+    assert status["status"] == "error"
+    assert status["summary"]["success_count"] == 0
+    assert all(entry["output_path"] is None and entry["error"] for entry in status["results"])
+    err = json.loads([line for line in captured.err.splitlines() if line.strip()][-1])
+    assert err["command"] == "search"
+    assert err["http_status"] == 429
+
+
+def test_search_batch_auth_failure_maps_to_10(capsys, monkeypatch, tmp_path):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (401, None))
+    assert cli.main(["search", "--query", "a"]) == cli.EXIT_AUTH
+
+
+def test_search_batch_runs_queries_in_parallel(monkeypatch, tmp_path, search_with_content_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+
+    def slow_post(path, body, key, timeout):
+        time.sleep(0.5)
+        return 200, search_with_content_fixture
+
+    monkeypatch.setattr(cli, "_post_json", slow_post)
+    args = parse(["search", "--query", "a", "--query", "b", "--query", "c", "--query", "d", "--concurrency", "4"])
+    start = time.monotonic()
+    code, status, error = cli.run_search(args, "fc-test-key")
+    elapsed = time.monotonic() - start
+    assert code == 0, error
+    assert status["summary"]["success_count"] == 4
+    # 4 sequential calls would take ~2.0s; 4 workers should finish near one call time.
+    assert elapsed < 1.5, f"batch did not run in parallel (elapsed {elapsed:.2f}s)"
+
+
+def test_search_batch_serial_forces_sequential(monkeypatch, tmp_path, search_with_content_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+
+    def slow_post(path, body, key, timeout):
+        time.sleep(0.4)
+        return 200, search_with_content_fixture
+
+    monkeypatch.setattr(cli, "_post_json", slow_post)
+    # --serial must win over --concurrency 8 and run one query at a time.
+    args = parse(["search", "--query", "a", "--query", "b", "--query", "c", "--serial", "--concurrency", "8"])
+    start = time.monotonic()
+    code, status, error = cli.run_search(args, "fc-test-key")
+    elapsed = time.monotonic() - start
+    assert code == 0, error
+    assert status["input"]["concurrency"] == 1
+    assert elapsed >= 1.2, f"--serial did not force sequential execution (elapsed {elapsed:.2f}s)"
+

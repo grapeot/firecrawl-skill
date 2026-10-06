@@ -64,6 +64,37 @@ python -m firecrawl_skill search "AI coding tools" --output /tmp/firecrawl_searc
 python -m firecrawl_skill search "AI coding tools" --stdout
 ```
 
+### Many queries in one call (batch mode)
+
+When you need several independent queries, launch them in a single process instead of N CLI invocations — the queries run in parallel internally, so the model makes one round-trip. Each `--query` is one complete query string; multi-word queries are not split.
+
+```bash
+python -m firecrawl_skill search \
+  --query "latest AI news" \
+  --query "openai releases" \
+  --query "anthropic news"
+```
+
+Batch mode (one or more `--query`) runs with `ThreadPoolExecutor`, `--concurrency N` workers (default 4) or sequentially with `--serial` (`--serial` overrides `--concurrency` and equals `--concurrency 1`). The positional query and `--query` are mutually exclusive; both or neither is a usage error (exit 2). `--stdout` and `--output` are single-query-only and are usage errors in batch mode — batch mode always writes one file per query.
+
+Batch mode preserves the one-query-one-file corpus invariant: each query writes its own full payload to an auto-named `search_{timestamp}_{slug}.json` under `FIRECRAWL_CLI_OUTPUT_DIR` (or `./tmp/firecrawl/`), with an index suffix if two queries slugify to the same name. Stdout returns exactly one batch status object, not the result content:
+
+```json
+{
+  "command": "search",
+  "status": "ok",
+  "output_mode": "batch",
+  "output_dir": "/path/to/output",
+  "input": { "queries": ["q1", "q2"], "concurrency": 4, "serial": false },
+  "summary": { "query_count": 2, "success_count": 2, "failed_count": 0, "credits_used": 16 },
+  "results": [
+    { "query": "q1", "output_path": "/path/to/output/search_..._q1.json", "summary": { "result_count": 6, "credits_used": 8 }, "error": null }
+  ]
+}
+```
+
+`status` is `ok` or `partial`. A partial failure exits 0 with the failed queries marked `error` in the status and reported on stderr, matching `extract`'s partial-failure semantics; only an all-fail batch exits with the first failure's mapped code (10/11/12/13). Batch `credits_used` sums the successful queries only. Read the per-query files under `results[*].output_path` for the actual results.
+
 ### URL content extraction
 
 ```bash
@@ -121,7 +152,10 @@ Check `data.remaining_credits` before a batch you expect to be expensive: at ~8 
 
 | Parameter | Description | Default |
 |---|---|---|
-| `query` | Search query | required |
+| `query` | Positional search query (single-query mode; mutually exclusive with `--query`) | required unless `--query` is used |
+| `--query` | One complete query string; repeat for a parallel multi-query batch (mutually exclusive with the positional query) | — |
+| `--concurrency` | Batch mode: number of queries in flight at once (≥1) | `4` |
+| `--serial` | Batch mode: force sequential execution; overrides `--concurrency` (equals `--concurrency 1`) | `False` |
 | `--max-results` | Number of results, range 1–20 | `6` |
 | `--search-depth` | `basic` / `advanced` / `fast` / `ultra-fast` (accepted for compatibility; Firecrawl has a single search mode, so the value is ignored with a stderr warning) | `advanced` |
 | `--topic` | `general` / `news` (`finance` is rejected; use `--include-domain` on finance sites) | `general` |
@@ -251,6 +285,7 @@ Integration tests hit the real Firecrawl API and consume credits. If `FIRECRAWL_
 - The currently stable commands are `search`, `extract`, and `usage`
 - `usage` reads a billing endpoint: 0 credits, and its normalized fields exist only where the API returns values (`data.raw` keeps the upstream body verbatim)
 - `--output` still produces JSON on stdout, but that stdout is the status schema, not the full search result
+- Batch mode (`--query`) writes one full-payload file per query and prints a single batch status object to stdout; `--stdout` and `--output` are rejected there, and a partial failure still exits 0
 - Exit codes: 0 ok / 2 usage error (bad arguments) / 10 auth / 11 quota-rate / 12 rejected-no-data / 13 network-server — the same table for all three commands, `usage` included
 
 ## Operational guidance

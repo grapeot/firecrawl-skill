@@ -51,7 +51,9 @@ Upstream: `POST /v2/search`.
 | `--country` | `location` (free text) and `country` (ISO code when inferrable) | both set when possible (upstream recommendation) |
 | `--timeout` (s, default 60) | `timeout` (ms, ×1000) | upstream max 300000 ms |
 | `--search-depth` (any of `basic`/`advanced`/`fast`/`ultra-fast`) | — | accepted, ignored, warning on stderr, recorded in `input` (upstream has no depth tiers) |
-| `--stdout` / `--output` | — | identical semantics to tavily-skill |
+| `query` (positional, optional) / `--query` (repeatable) | `query` per request | positional = single mode; `--query` = batch mode (one request per value). Both or neither → usage error |
+| `--concurrency N` / `--serial` | — | batch fan-out control; `--serial` forces 1 and overrides `--concurrency`; default 4 |
+| `--stdout` / `--output` | — | identical semantics to tavily-skill; single mode only (usage error in batch mode) |
 
 Request body is otherwise minimal: no `categories`, no `enterprise`, no `threatProtection`. `highlights` stays at its upstream default (`true`).
 
@@ -104,6 +106,16 @@ The upstream 404 envelope carries `code: "NOT_FOUND"` and a `documentation_url`,
 
 Field-name drift on the historical endpoint: the OpenAPI response schema names the per-period value `totalCredits`, the live response names it `creditsUsed`. `_normalize_period` reads `creditsUsed` first and falls back to `totalCredits`, so a rename in either direction leaves `credits_used` populated instead of silently `null`.
 
+### D8 — multi-query batch mode for `search`
+
+An agent workflow that needs N independent searches otherwise pays N CLI round-trips. Batch mode lets one invocation carry N queries and execute them internally in parallel. It stays stdlib-only via `concurrent.futures.ThreadPoolExecutor`.
+
+- Interface: the positional `query` becomes optional (`nargs="?"`); a repeatable `--query` (dest `queries`, `action="append"`) selects batch mode. Each `--query` is one complete query string. Positional + `--query` → usage error; neither → usage error.
+- Parallelism: `--concurrency N` (int ≥1, default 4) or `--serial` (forces 1, overrides `--concurrency`).
+- Invariant preservation: one query still maps to one full-payload file under the default output dir, so the timestamped corpus invariant holds. `--stdout`/`--output` are single-mode only; both are usage errors in batch mode. Auto-naming shares the single-mode `_slugify` + timestamp scheme and appends an index on collision.
+- Stdout: exactly one batch status object (one entry per query with `query`/`output_path`/`summary`/`error`, plus `query_count`/`success_count`/`failed_count`/`credits_used`), never raw content inline.
+- Exit codes reuse the existing contract unchanged: 0 on success **including partial failure** (per-query errors in the status and a stderr warning, mirroring `run_extract` partial failure); all-fail returns the first failure's mapped code (10/11/12/13); argument errors stay 2. Batch `credits_used` sums successful queries only. No new codes.
+
 ## Validation rules
 
 1. `--include-domain` and `--exclude-domain` are mutually exclusive (search).
@@ -115,6 +127,8 @@ Field-name drift on the historical endpoint: the OpenAPI response schema names t
 7. `--image-descriptions`, `--topic finance` → usage error.
 8. Invalid dates → usage error with the offending value.
 9. `usage`: `--timeout` > 0; `--history` in 0–100; `--stdout` and `--output` mutually exclusive.
+10. `search`: positional `query` and `--query` are mutually exclusive; exactly one form is required.
+11. `search` batch (`--query` present): `--concurrency` ≥ 1; `--stdout` and `--output` are usage errors.
 
 ## Normalization — `usage`
 
@@ -182,6 +196,8 @@ Resolution order: `FIRECRAWL_API_KEY` → `ONEPASSWORD_FIRECRAWL_REFERENCE` (via
 ## Output files
 
 Auto-named under `FIRECRAWL_CLI_OUTPUT_DIR` (default `./tmp/firecrawl/`): `{command}_{YYYYMMDD_HHMMSS}_{slug}.json`, slug from the query (search) or first URL (extract), same slug rules as tavily-skill. `--output` writes to the given path. Stdout status object: `{command, status: "ok", output_mode: "file", output_path, payload_bytes, summary: {result_count, failed_count, image_count, credits_used}, payload_schema}` plus a `Saved JSON to ...` line on stderr.
+
+Batch mode keeps the same file naming but emits one file per query (one shared timestamp, index suffix on slug collision) and a batch status object instead: `{command, status: ok|partial|error, output_mode: "batch", output_dir, input: {queries, concurrency, serial, ...shared search flags}, summary: {query_count, success_count, failed_count, credits_used}, results: [{query, output_path, summary, error}]}`. Failed queries carry `output_path: null` and an `error` object.
 
 ## Capability gaps (user-facing behavior)
 
