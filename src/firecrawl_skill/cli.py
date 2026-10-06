@@ -421,6 +421,10 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("Provide either a positional query or --query, not both.")
     if not has_positional_query and not has_batch_queries:
         parser.error("Provide a search query: a positional query, or one or more --query values.")
+    if has_positional_query and not args.query.strip():
+        parser.error("Search query must not be empty.")
+    if has_batch_queries and any(not query.strip() for query in args.queries):
+        parser.error("--query values must not be empty.")
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1.")
     if has_batch_queries and args.stdout:
@@ -1098,6 +1102,48 @@ def _payload_schema(command: object) -> dict[str, Any]:
     }
 
 
+def _batch_payload_schema() -> dict[str, Any]:
+    """Schema hint for the `search` batch status envelope (mirrors the single-mode convention)."""
+    return {
+        "command": "string",
+        "status": "string",
+        "output_mode": "string",
+        "output_dir": "string",
+        "input": {
+            "queries": "array",
+            "concurrency": "number",
+            "serial": "boolean",
+            "max_results": "number",
+            "search_depth": "string",
+            "topic": "string",
+            "time_range": "string|null",
+            "start_date": "string|null",
+            "end_date": "string|null",
+            "include_domains": "array",
+            "exclude_domains": "array",
+            "include_images": "boolean",
+            "raw_content": "string",
+            "country": "string|null",
+            "timeout": "number",
+        },
+        "summary": {
+            "query_count": "number",
+            "success_count": "number",
+            "failed_count": "number",
+            "credits_used": "number|null",
+        },
+        "results": [
+            {
+                "query": "string",
+                "output_path": "string|null",
+                "summary": "object|null",
+                "error": "object|null",
+            }
+        ],
+    }
+
+
+
 def _estimate_search_credits(args: argparse.Namespace) -> int:
     search_credits = 2 * math.ceil(args.max_results / 10)
     scrape_credits = args.max_results if args.raw_content != "off" else 0
@@ -1189,10 +1235,17 @@ def run_search_batch(
         for index in range(len(queries)):
             outcomes[index] = work(index)
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+        completed = False
+        try:
             future_to_index = {executor.submit(work, index): index for index in range(len(queries))}
             for future in concurrent.futures.as_completed(future_to_index):
                 outcomes[future_to_index[future]] = future.result()
+            completed = True
+        finally:
+            # On Ctrl-C, stop waiting for in-flight requests and drop pending ones so the
+            # interrupt returns promptly instead of blocking in shutdown(wait=True).
+            executor.shutdown(wait=completed, cancel_futures=not completed)
 
     entries: list[dict[str, Any]] = []
     success_count = 0
@@ -1211,7 +1264,7 @@ def run_search_batch(
             )
             success_count += 1
             credits = summary.get("credits_used")
-            if isinstance(credits, int) and not isinstance(credits, bool):
+            if isinstance(credits, (int, float)) and not isinstance(credits, bool):
                 credits_total += credits
                 has_credits = True
         else:
@@ -1253,6 +1306,7 @@ def run_search_batch(
             "credits_used": credits_total if has_credits else None,
         },
         "results": entries,
+        "payload_schema": _batch_payload_schema(),
     }
 
     if success_count == 0:
@@ -1433,5 +1487,20 @@ def main(argv: list[str] | None = None) -> int:
     return EXIT_OK
 
 
+def _cli_exit(code: int) -> None:
+    """Terminate the `__main__` entry points with `code`.
+
+    A Ctrl-C during a parallel batch makes `main` return 130, but CPython still joins
+    the executor's non-daemon worker threads at interpreter exit, so a plain
+    `SystemExit(130)` would wait for in-flight requests to finish. On an interrupt we
+    flush output and terminate immediately instead: the user asked to stop.
+    """
+    if code == 130:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        return os._exit(130)
+    raise SystemExit(code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _cli_exit(main())

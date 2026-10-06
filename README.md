@@ -77,19 +77,21 @@ Batch mode preserves the one-query-one-file corpus invariant: each query writes 
 ```json
 {
   "command": "search",
-  "status": "ok",
+  "status": "partial",
   "output_mode": "batch",
   "output_dir": "/path/to/output",
   "input": { "queries": ["q1", "q2", "q3"], "concurrency": 4, "serial": false, "...": "shared search flags" },
-  "summary": { "query_count": 3, "success_count": 3, "failed_count": 0, "credits_used": 24 },
+  "summary": { "query_count": 3, "success_count": 2, "failed_count": 1, "credits_used": 16 },
   "results": [
     { "query": "q1", "output_path": "/path/to/output/search_..._q1.json", "summary": { "result_count": 6, "credits_used": 8 }, "error": null },
-    { "query": "q2", "output_path": null, "summary": null, "error": { "http_status": 500, "error": "HTTP 500" } }
-  ]
+    { "query": "q2", "output_path": "/path/to/output/search_..._q2.json", "summary": { "result_count": 6, "credits_used": 8 }, "error": null },
+    { "query": "q3", "output_path": null, "summary": null, "error": { "http_status": 500, "error": "HTTP 500" } }
+  ],
+  "payload_schema": { "...": "one entry per envelope field, mirroring the single-mode convention" }
 }
 ```
 
-`status` is `ok` when every query succeeds and `partial` when some fail. A partial failure still exits 0, with each failed query reported in the status and a `Warning:` line on stderr, exactly like `extract`'s partial failure. Only when every query fails does the command exit with the first failure's mapped code (10/11/12/13). Batch credits sum only the successful queries. The batch status object is lightweight — full result content lives in the per-query files.
+`status` is `ok` when every query succeeds, `partial` when some fail, and `error` when all fail. A partial failure still exits 0, with each failed query reported in the status and a `Warning:` line on stderr, exactly like `extract`'s partial failure; only the all-failed `error` case exits with the first failure's mapped code (10/11/12/13). Batch credits sum only the successful queries — in the example above the two successes contribute 8 + 8 = 16, and the failed query adds nothing. The batch status object is lightweight (no raw content inline) and carries a `payload_schema` hint; full result content lives in the per-query files.
 
 ### `extract`
 

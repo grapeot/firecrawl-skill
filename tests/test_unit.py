@@ -1302,3 +1302,69 @@ def test_search_batch_serial_forces_sequential(monkeypatch, tmp_path, search_wit
     assert status["input"]["concurrency"] == 1
     assert elapsed >= 1.2, f"--serial did not force sequential execution (elapsed {elapsed:.2f}s)"
 
+
+def test_search_empty_positional_query_rejected():
+    usage_error(["search", "   "])
+    usage_error(["search", ""])
+
+
+def test_search_empty_batch_query_rejected():
+    usage_error(["search", "--query", "ok", "--query", ""])
+    usage_error(["search", "--query", "   "])
+
+
+def test_search_batch_envelope_shape(capsys, monkeypatch, tmp_path, search_with_content_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, search_with_content_fixture))
+
+    rc = cli.main(["search", "--query", "alpha", "--query", "beta"])
+    assert rc == 0
+    status = json.loads(capsys.readouterr().out)
+    assert set(status) == {
+        "command",
+        "status",
+        "output_mode",
+        "output_dir",
+        "input",
+        "summary",
+        "results",
+        "payload_schema",
+    }
+    schema = status["payload_schema"]
+    # The schema describes every emitted field except itself.
+    assert set(schema) == set(status) - {"payload_schema"}
+    assert schema["input"]["concurrency"] == "number"
+    assert schema["results"][0]["output_path"] == "string|null"
+    assert schema["results"][0]["error"] == "object|null"
+
+
+def test_search_batch_credits_accepts_float(monkeypatch, tmp_path, search_with_content_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
+    fixture = json.loads(json.dumps(search_with_content_fixture))
+    fixture["creditsUsed"] = 3.5
+    monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, fixture))
+
+    args = parse(["search", "--query", "a", "--query", "b"])
+    code, status, error = cli.run_search(args, "fc-test-key")
+    assert code == 0, error
+    assert status["summary"]["credits_used"] == 7.0  # float credits are summed, not nulled
+
+
+def test_cli_exit_130_terminates_immediately(monkeypatch):
+    # Ctrl-C must not wait for batch worker threads at interpreter exit.
+    calls = []
+    monkeypatch.setattr(cli.os, "_exit", lambda code: calls.append(code))
+    cli._cli_exit(130)  # os._exit never returns in production; the stub returns None
+    assert calls == [130]
+
+
+def test_cli_exit_other_codes_raise_systemexit():
+    for code in (0, 2, 10, 13):
+        with pytest.raises(SystemExit) as excinfo:
+            cli._cli_exit(code)
+        assert excinfo.value.code == code
+
+
+

@@ -88,12 +88,14 @@ Batch mode preserves the one-query-one-file corpus invariant: each query writes 
   "input": { "queries": ["q1", "q2"], "concurrency": 4, "serial": false },
   "summary": { "query_count": 2, "success_count": 2, "failed_count": 0, "credits_used": 16 },
   "results": [
-    { "query": "q1", "output_path": "/path/to/output/search_..._q1.json", "summary": { "result_count": 6, "credits_used": 8 }, "error": null }
-  ]
+    { "query": "q1", "output_path": "/path/to/output/search_..._q1.json", "summary": { "result_count": 6, "credits_used": 8 }, "error": null },
+    { "query": "q2", "output_path": "/path/to/output/search_..._q2.json", "summary": { "result_count": 6, "credits_used": 8 }, "error": null }
+  ],
+  "payload_schema": { "...": "schema hint for this envelope" }
 }
 ```
 
-`status` is `ok` or `partial`. A partial failure exits 0 with the failed queries marked `error` in the status and reported on stderr, matching `extract`'s partial-failure semantics; only an all-fail batch exits with the first failure's mapped code (10/11/12/13). Batch `credits_used` sums the successful queries only. Read the per-query files under `results[*].output_path` for the actual results.
+`status` is `ok` (all queries succeed), `partial` (some fail), or `error` (all fail). A partial failure exits 0 with the failed queries marked `error` in the status and reported on stderr, matching `extract`'s partial-failure semantics; only an all-fail batch exits with the first failure's mapped code (10/11/12/13). Batch `credits_used` sums the successful queries only. Read the per-query files under `results[*].output_path` for the actual results.
 
 ### URL content extraction
 

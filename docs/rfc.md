@@ -113,7 +113,7 @@ An agent workflow that needs N independent searches otherwise pays N CLI round-t
 - Interface: the positional `query` becomes optional (`nargs="?"`); a repeatable `--query` (dest `queries`, `action="append"`) selects batch mode. Each `--query` is one complete query string. Positional + `--query` → usage error; neither → usage error.
 - Parallelism: `--concurrency N` (int ≥1, default 4) or `--serial` (forces 1, overrides `--concurrency`).
 - Invariant preservation: one query still maps to one full-payload file under the default output dir, so the timestamped corpus invariant holds. `--stdout`/`--output` are single-mode only; both are usage errors in batch mode. Auto-naming shares the single-mode `_slugify` + timestamp scheme and appends an index on collision.
-- Stdout: exactly one batch status object (one entry per query with `query`/`output_path`/`summary`/`error`, plus `query_count`/`success_count`/`failed_count`/`credits_used`), never raw content inline.
+- Stdout: exactly one batch status object (one entry per query with `query`/`output_path`/`summary`/`error`, plus `query_count`/`success_count`/`failed_count`/`credits_used` and a `payload_schema` hint), never raw content inline.
 - Exit codes reuse the existing contract unchanged: 0 on success **including partial failure** (per-query errors in the status and a stderr warning, mirroring `run_extract` partial failure); all-fail returns the first failure's mapped code (10/11/12/13); argument errors stay 2. Batch `credits_used` sums successful queries only. No new codes.
 
 ## Validation rules
@@ -129,6 +129,7 @@ An agent workflow that needs N independent searches otherwise pays N CLI round-t
 9. `usage`: `--timeout` > 0; `--history` in 0–100; `--stdout` and `--output` mutually exclusive.
 10. `search`: positional `query` and `--query` are mutually exclusive; exactly one form is required.
 11. `search` batch (`--query` present): `--concurrency` ≥ 1; `--stdout` and `--output` are usage errors.
+12. `search`: empty or whitespace-only queries are usage errors, in both single and batch mode.
 
 ## Normalization — `usage`
 
