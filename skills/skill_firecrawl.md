@@ -263,6 +263,20 @@ For `usage`, `data` carries the balance instead of results:
 
 In default mode, stdout does not return this full payload. It returns a lightweight object containing the output path, summary information (including `credits_used`), and payload schema. The full payload only prints to stdout when `--stdout` is passed.
 
+## Speed optimization
+
+For independent queries, prefer one batch invocation over N separate CLI calls:
+
+```bash
+python -m firecrawl_skill search --query "q1" --query "q2" --query "q3"
+```
+
+Each standalone `python -m firecrawl_skill search "<q>"` invocation re-pays a fixed cost before the first byte of a response: process/interpreter startup, module import, TLS setup, and API-key resolution. When the key comes from `ONEPASSWORD_FIRECRAWL_REFERENCE`, resolution is an `op read` subprocess call and costs roughly 0.9s per invocation on top of the rest. Batch mode pays this once and then collapses the N serial API waits into one parallel wave, so the saving grows with N.
+
+To remove the `op read` term entirely, put a raw `FIRECRAWL_API_KEY=...` directly in the repo-local, gitignored `.env`. The CLI reads `FIRECRAWL_API_KEY` first and skips 1Password, reducing the per-call fixed cost to process startup plus connection setup. Never commit that value or place it in any tracked file.
+
+`benchmarks/latency.py` measures the difference end to end. It is opt-in (`RUN_FIRECRAWL_LATENCY=1`) because it spends real credits; use it to size the win for your own query mix rather than trusting a single number.
+
 ## Testing
 
 Run unit tests only (default, offline):

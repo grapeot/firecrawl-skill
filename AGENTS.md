@@ -17,6 +17,9 @@ python -m pytest tests/ -v
 
 # live integration tests (opt-in; consumes Firecrawl credits)
 RUN_FIRECRAWL_INTEGRATION=1 python -m pytest tests/test_integration.py -v
+
+# latency benchmark (opt-in; spends real Firecrawl credits)
+RUN_FIRECRAWL_LATENCY=1 python benchmarks/latency.py --queries 4 --repeats 2
 ```
 
 ## Invariants
@@ -37,4 +40,5 @@ RUN_FIRECRAWL_INTEGRATION=1 python -m pytest tests/test_integration.py -v
 - `tests/` — `test_unit.py` (offline), `test_integration.py` (live, opt-in)
 - `fixtures/` — recorded and anonymized Firecrawl v2 responses for offline normalization tests (billing fixtures use synthetic credit figures and shifted dates, never the live account's numbers)
 - `skills/skill_firecrawl.md` — public agent skill document
+- `benchmarks/` — opt-in latency benchmark (`latency.py`, stdlib only) and its methodology (`README.md`)
 - `docs/` — prd / rfc / working notes
