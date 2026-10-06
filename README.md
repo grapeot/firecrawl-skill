@@ -126,6 +126,10 @@ python -m firecrawl_skill usage --stdout
 
 Normalized top-level fields mirror only what the upstream API returns; `credits_used_in_period` is derived as `plan_credits - remaining_credits` and is `null` when either input is missing. `data.raw` keeps the full upstream body verbatim, so every normalized field is auditable. `data.periods` holds `{start_date, end_date, credits_used}` per closed billing period (`end_date` is `null` for an open period) and stays empty without `--history`.
 
+## Performance
+
+For independent queries, batch mode is faster than N standalone invocations. Each standalone `python -m firecrawl_skill search ...` pays the fixed per-process cost — interpreter startup, module import, TLS setup, and API-key resolution — and then waits on one API round-trip; batch mode pays that fixed cost once and runs the queries as a single parallel wave. At N=4 the win is typically several times the wall-clock of one call, not a constant shave. `--concurrency` controls the wave width and `--serial` runs the same batch one-at-a-time as a control. [`benchmarks/latency.py`](benchmarks/latency.py) reproduces the numbers end to end (opt-in via `RUN_FIRECRAWL_LATENCY=1`; it spends real credits).
+
 ## Output
 
 The top-level structure is fixed:
