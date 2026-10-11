@@ -53,7 +53,7 @@ Upstream: `POST /v2/search`.
 | `--search-depth` (any of `basic`/`advanced`/`fast`/`ultra-fast`) | — | accepted, ignored, warning on stderr, recorded in `input` (upstream has no depth tiers) |
 | `query` (positional, optional) / `--query` (repeatable) | `query` per request | positional = single mode; `--query` = batch mode (one request per value). Both or neither → usage error |
 | `--concurrency N` / `--serial` | — | batch fan-out control; `--serial` forces 1 and overrides `--concurrency`; default 4 |
-| `--stdout` / `--output` | — | identical semantics to tavily-skill; single mode only (usage error in batch mode) |
+| `--stdout` / `--output` | — | `--output PATH` writes the full payload and emits a status object. `--stdout` is rejected (exit 2, before any request, no file, no credits). `--output` is single-mode only |
 
 Request body is otherwise minimal: no `categories`, no `enterprise`, no `threatProtection`. `highlights` stays at its upstream default (`true`).
 
@@ -78,7 +78,7 @@ Upstream: `POST /v2/scrape`, one request per URL, sequential.
 | `--images` | `formats` += `"images"` | image URLs found on the page |
 | `--favicon` | — | not requested explicitly; `metadata.faviconUrl` passed through when present (verify field name against live responses during implementation) |
 | `--timeout` (s, default 60) | `timeout` (ms) | per-URL timeout, upstream max 300000 ms |
-| `--stdout` / `--output` | — | identical semantics to tavily-skill |
+| `--stdout` / `--output` | — | `--output PATH` writes the full payload and emits a status object. `--stdout` is rejected (exit 2, before any request, no file, no credits) |
 
 Per-URL result shape: `{url, markdown: <upstream data.markdown>, highlights, images, metadata, error: null}`; on failure: `{url, error: <upstream error string or HTTP status>}`. `data.credits_used` is the sum across successful scrapes (upstream `creditsUsed`/`metadata.creditCount` when present).
 
@@ -112,7 +112,7 @@ An agent workflow that needs N independent searches otherwise pays N CLI round-t
 
 - Interface: the positional `query` becomes optional (`nargs="?"`); a repeatable `--query` (dest `queries`, `action="append"`) selects batch mode. Each `--query` is one complete query string. Positional + `--query` → usage error; neither → usage error.
 - Parallelism: `--concurrency N` (int ≥1, default 4) or `--serial` (forces 1, overrides `--concurrency`).
-- Invariant preservation: one query still maps to one full-payload file under the default output dir, so the timestamped corpus invariant holds. `--stdout`/`--output` are single-mode only; both are usage errors in batch mode. Auto-naming shares the single-mode `_slugify` + timestamp scheme and appends an index on collision.
+- Invariant preservation: one query still maps to one full-payload file under the default output dir, so the timestamped corpus invariant holds. `--stdout` is rejected for every search. `--output` is a usage error in batch mode. Auto-naming shares the single-mode `_slugify` + timestamp scheme and appends an index on collision.
 - Stdout: exactly one batch status object (one entry per query with `query`/`output_path`/`summary`/`error`, plus `query_count`/`success_count`/`failed_count`/`credits_used` and a `payload_schema` hint), never raw content inline.
 - Exit codes reuse the existing contract unchanged: 0 on success **including partial failure** (per-query errors in the status and a stderr warning, mirroring `run_extract` partial failure); all-fail returns the first failure's mapped code (10/11/12/13); argument errors stay 2. Batch `credits_used` sums successful queries only. No new codes.
 
@@ -122,13 +122,13 @@ An agent workflow that needs N independent searches otherwise pays N CLI round-t
 2. `--time-range` and `--start-date`/`--end-date` are mutually exclusive (search).
 3. `--start-date` and `--end-date` must be paired.
 4. `--max-results` in 1–20; `--timeout` > 0 (search and extract).
-5. `--stdout` and `--output` are mutually exclusive.
+5. `search` and `extract` reject `--stdout` (exit 2, before any request). For `usage`, `--stdout` and `--output` are mutually exclusive.
 6. Extract URL count in 1–20.
 7. `--image-descriptions`, `--topic finance` → usage error.
 8. Invalid dates → usage error with the offending value.
 9. `usage`: `--timeout` > 0; `--history` in 0–100; `--stdout` and `--output` mutually exclusive.
 10. `search`: positional `query` and `--query` are mutually exclusive; exactly one form is required.
-11. `search` batch (`--query` present): `--concurrency` ≥ 1; `--stdout` and `--output` are usage errors.
+11. `search` batch (`--query` present): `--concurrency` ≥ 1; `--output` is a usage error. `--stdout` is a usage error for every search, including batch.
 12. `search`: empty or whitespace-only queries are usage errors, in both single and batch mode.
 
 ## Normalization — `usage`
