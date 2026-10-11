@@ -2,7 +2,7 @@
 
 Agent-facing web search, URL extraction, and account credit-usage reporting backed by the [Firecrawl v2 API](https://docs.firecrawl.dev/api-reference/endpoint/search).
 
-The search and extract commands are a drop-in mirror of [tavily-skill](https://github.com/grapeot/tavily-skill): the same subcommands (`search`, `extract`), the same flag names and defaults, the same JSON envelope, and the same file-output behavior. Downstream workflows that consume tavily-skill payloads work unchanged. `usage` is this repo's own addition — check it with `--help` before assuming any other flag names.
+The search and extract commands mirror [tavily-skill](https://github.com/grapeot/tavily-skill): the same subcommands (`search`, `extract`), the same flag names and defaults, the same JSON envelope, and the same file-output behavior, with one exception: `search` and `extract` do not accept `--stdout`. Workflows that read the payload file still see that envelope. `usage` is this repo's own addition — check it with `--help` before assuming any other flag names.
 
 ## Quickstart
 
@@ -33,9 +33,6 @@ python -m firecrawl_skill search \
 python -m firecrawl_skill search "agent framework" \
   --include-domain github.com \
   --include-domain docs.anthropic.com
-
-# print full JSON directly to stdout
-python -m firecrawl_skill search "AI coding tools" --stdout
 
 # URL content extraction
 python -m firecrawl_skill extract https://example.com
@@ -70,7 +67,7 @@ A single query is the positional form: `search "some query"`. An agent that need
 python -m firecrawl_skill search --query "q1" --query "q2" --query "q3"
 ```
 
-Batch mode runs the queries in parallel with `concurrent.futures.ThreadPoolExecutor` (no new dependencies), at `--concurrency N` workers (default 4) or sequentially with `--serial`. `--serial` wins over `--concurrency` and is equivalent to `--concurrency 1`. The positional query and `--query` are mutually exclusive; giving both, or neither, is a usage error (exit 2). `--output` and `--stdout` apply to single-query mode only and are usage errors in batch mode.
+Batch mode runs the queries in parallel with `concurrent.futures.ThreadPoolExecutor` (no new dependencies), at `--concurrency N` workers (default 4) or sequentially with `--serial`. `--serial` wins over `--concurrency` and is equivalent to `--concurrency 1`. The positional query and `--query` are mutually exclusive; giving both, or neither, is a usage error (exit 2). `--output` applies only to single-query search and is rejected in batch mode. `search` never accepts `--stdout`.
 
 Batch mode preserves the one-query-one-file corpus invariant: each query writes its own full-payload JSON file under `FIRECRAWL_CLI_OUTPUT_DIR` (or `./tmp/firecrawl/`), auto-named `search_{timestamp}_{slug}.json` with an index suffix on slug collision. Stdout carries exactly one batch status object — one entry per query plus aggregate counts and summed credits:
 
@@ -147,7 +144,7 @@ The top-level structure is fixed:
 }
 ```
 
-In default mode the full payload is written to an auto-named file and stdout carries a lightweight status object. Use `--stdout` for the full payload inline, or `--output PATH` for a named file.
+Every search and extract writes the complete payload to disk and emits a lightweight status object on stdout. Pass `--output PATH` to write that payload to a specific file instead of the default directory. For search, this applies only to single-query mode; batch search rejects it. `usage` also accepts `--output PATH`, mutually exclusive with `--stdout`. The full payload prints to stdout only for `usage --stdout`. See [Reading results from disk](skills/skill_firecrawl.md#reading-results-from-disk) for an executable status → exact path → JSON reader covering single search, extract, and batch search, with exit-code checks, bounded previews, and indexed range expansion.
 
 ### Cost breakdown
 

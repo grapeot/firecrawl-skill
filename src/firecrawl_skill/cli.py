@@ -2,8 +2,8 @@
 """firecrawl_skill CLI.
 
 Agent-facing web search, URL extraction, and account credit-usage reporting over the
-Firecrawl v2 API. The search/extract command surface and output contract mirror
-tavily-skill; see docs/rfc.md.
+Firecrawl v2 API. search and extract always write the full payload to a file and reject
+--stdout before any request; usage still accepts --stdout. See docs/rfc.md.
 """
 from __future__ import annotations
 
@@ -59,6 +59,12 @@ EXIT_AUTH = 10
 EXIT_QUOTA_RATE = 11
 EXIT_REJECTED = 12
 EXIT_NETWORK_SERVER = 13
+
+# search/extract must not inline a payload. usage still accepts --stdout.
+_STDOUT_REJECTED = (
+    "--stdout is not supported for search or extract; the full payload is always "
+    "written to a file and stdout returns a status object. usage still accepts --stdout."
+)
 
 # Optional 1Password reference, e.g. op://Vault/Item/field — never commit real vault paths.
 _ONEPASSWORD_REF_ENV = "ONEPASSWORD_FIRECRAWL_REFERENCE"
@@ -240,7 +246,10 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument(
         "--stdout",
         action="store_true",
-        help="Print the full JSON payload to stdout instead of writing it to the default output file",
+        help=(
+            "Rejected for search (exit 2, before any request). The full payload is always "
+            "written to a file; stdout returns a status object. usage still accepts this flag"
+        ),
     )
     search_parser.add_argument(
         "--raw-content",
@@ -317,7 +326,10 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument(
         "--stdout",
         action="store_true",
-        help="Print the full JSON payload to stdout instead of writing it to the default output file",
+        help=(
+            "Rejected for extract (exit 2, before any request). The full payload is always "
+            "written to a file; stdout returns a status object. usage still accepts this flag"
+        ),
     )
     extract_parser.add_argument(
         "--output",
@@ -392,6 +404,12 @@ def _build_tbs(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _reject_content_stdout(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """search/extract --stdout is a usage error, before any request."""
+    if getattr(args, "stdout", False):
+        parser.error(_STDOUT_REJECTED)
+
+
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.command == "usage":
         if args.timeout <= 0:
@@ -403,10 +421,9 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         return
 
     if args.command == "extract":
+        _reject_content_stdout(parser, args)
         if args.timeout <= 0:
             parser.error("--timeout must be greater than 0.")
-        if args.stdout and args.output:
-            parser.error("Use either --stdout or --output, not both.")
         if not 1 <= len(args.urls) <= MAX_URLS_LIMIT:
             parser.error(f"extract accepts between 1 and {MAX_URLS_LIMIT} URLs.")
         if args.chunks_per_source is not None and args.chunks_per_source <= 0:
@@ -427,8 +444,7 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--query values must not be empty.")
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1.")
-    if has_batch_queries and args.stdout:
-        parser.error("--stdout is not valid in batch mode; batch mode always writes one file per query.")
+    _reject_content_stdout(parser, args)
     if has_batch_queries and args.output:
         parser.error("--output is not valid in batch mode; batch mode always writes one file per query.")
 
@@ -441,8 +457,6 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             _build_tbs(args)  # validates date format early
         except argparse.ArgumentTypeError as exc:
             parser.error(str(exc))
-    if args.stdout and args.output:
-        parser.error("Use either --stdout or --output, not both.")
     if not 1 <= args.max_results <= MAX_RESULTS_LIMIT:
         parser.error(f"--max-results must be between 1 and {MAX_RESULTS_LIMIT}.")
     if args.timeout <= 0:
@@ -1024,7 +1038,12 @@ def _default_output_path(args: argparse.Namespace) -> str:
 
 
 def _resolve_output_path(args: argparse.Namespace) -> str | None:
-    if getattr(args, "stdout", False):
+    """Return the file path for a full payload, or None only for usage --stdout.
+
+    search and extract always write. A True stdout flag on those commands is a usage
+    error and must not reach this function; if it does, still write the file.
+    """
+    if args.command == "usage" and getattr(args, "stdout", False):
         return None
     if getattr(args, "output", None):
         return args.output

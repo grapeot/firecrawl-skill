@@ -99,9 +99,26 @@ def test_image_descriptions_rejected():
     usage_error(["search", "q", "--image-descriptions"])
 
 
-def test_stdout_and_output_mutually_exclusive():
+def test_search_extract_stdout_rejected():
+    usage_error(["search", "q", "--stdout"])
+    usage_error(["extract", "https://example.com", "--stdout"])
     usage_error(["search", "q", "--stdout", "--output", "x.json"])
     usage_error(["extract", "https://example.com", "--stdout", "--output", "x.json"])
+
+
+def test_search_extract_help_does_not_promise_inline_stdout(capsys):
+    for command in ("search", "extract"):
+        with pytest.raises(SystemExit) as excinfo:
+            cli.build_parser().parse_args([command, "--help"])
+        assert excinfo.value.code == 0
+        help_text = capsys.readouterr().out
+        assert "Rejected for" in help_text
+        assert "instead of writing it to the default output file" not in help_text
+    with pytest.raises(SystemExit) as excinfo:
+        cli.build_parser().parse_args(["usage", "--help"])
+    assert excinfo.value.code == 0
+    usage_help = capsys.readouterr().out
+    assert "Print the full JSON payload to stdout" in usage_help
 
 
 def test_extract_url_limit():
@@ -752,7 +769,7 @@ def test_get_api_key_bad_op_reference_raises(monkeypatch):
 
 
 def test_emit_payload_stdout(capsys):
-    payload = {"command": "search", "input": {}, "data": {"result_count": 1}}
+    payload = {"command": "usage", "input": {}, "data": {"remaining_credits": 1}}
     cli._emit_payload(payload, None)
     assert json.loads(capsys.readouterr().out) == payload
 
@@ -785,23 +802,54 @@ def test_emit_payload_file(capsys, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_main_search_success(capsys, monkeypatch, search_with_content_fixture):
+def _assert_status_points_at_full_payload(status, command):
+    assert status["command"] == command
+    assert status["status"] == "ok"
+    assert status["output_mode"] == "file"
+    assert status["output_path"]
+    assert "payload_schema" in status
+    assert "data" not in status
+    payload = json.loads(Path(status["output_path"]).read_text(encoding="utf-8"))
+    assert payload["command"] == command
+    assert "data" in payload
+    return payload
+
+
+def test_search_extract_stdout_rejected_before_request(monkeypatch):
+    def explode(*_args, **_kwargs):
+        raise AssertionError("network or key lookup was called")
+
+    monkeypatch.setattr(cli, "_post_json", explode)
+    monkeypatch.setattr(cli, "_get_json", explode)
+    monkeypatch.setattr(cli, "_get_api_key", explode)
+    for argv in (
+        ["search", "q", "--stdout"],
+        ["extract", "https://example.com", "--stdout"],
+        ["search", "--query", "q", "--stdout"],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(argv)
+        assert excinfo.value.code == 2
+
+
+def test_main_search_success(capsys, monkeypatch, tmp_path, search_with_content_fixture):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
     monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, search_with_content_fixture))
-    args = cli.build_parser().parse_args(["search", "firecrawl", "--max-results", "2", "--stdout"])
-    cli._validate_args(cli.build_parser(), args)
-    rc = cli.main(["search", "firecrawl", "--max-results", "2", "--stdout"])
+    rc = cli.main(["search", "firecrawl", "--max-results", "2"])
     assert rc == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["command"] == "search"
-    assert out["data"]["result_count"] == 2
+    status = json.loads(capsys.readouterr().out)
+    payload = _assert_status_points_at_full_payload(status, "search")
+    assert payload["data"]["result_count"] == 2
+    assert payload["data"]["results"][0]["raw_content"]
+    assert "raw_content" not in status["summary"]
 
 
 def test_main_search_auth_error(capsys, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)  # avoid .env resolving a real key
     monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
     monkeypatch.delenv(cli._ONEPASSWORD_REF_ENV, raising=False)
-    rc = cli.main(["search", "q", "--stdout"])
+    rc = cli.main(["search", "q"])
     assert rc == cli.EXIT_AUTH
     lines = [l for l in capsys.readouterr().err.splitlines() if l.strip()]
     err = json.loads(lines[-1])
@@ -812,7 +860,7 @@ def test_main_search_auth_error(capsys, monkeypatch, tmp_path):
 def test_main_search_upstream_error(capsys, monkeypatch):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
     monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (429, {"error": "credits exhausted"}))
-    rc = cli.main(["search", "q", "--stdout"])
+    rc = cli.main(["search", "q"])
     assert rc == cli.EXIT_QUOTA_RATE
     lines = [l for l in capsys.readouterr().err.splitlines() if l.strip()]
     err = json.loads(lines[-1])
@@ -820,8 +868,9 @@ def test_main_search_upstream_error(capsys, monkeypatch):
     assert "credits exhausted" in err["error"]
 
 
-def test_main_extract_partial_failure(capsys, monkeypatch, scrape_ok_fixture):
+def test_main_extract_partial_failure(capsys, monkeypatch, tmp_path, scrape_ok_fixture):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
 
     def fake_post(path, body, key, timeout):
         if body["url"] == "https://bad.example":
@@ -829,42 +878,48 @@ def test_main_extract_partial_failure(capsys, monkeypatch, scrape_ok_fixture):
         return 200, scrape_ok_fixture
 
     monkeypatch.setattr(cli, "_post_json", fake_post)
-    rc = cli.main(["extract", "https://example.com", "https://bad.example", "--stdout"])
+    rc = cli.main(["extract", "https://example.com", "https://bad.example"])
     assert rc == 0
     captured = capsys.readouterr()
-    out = json.loads(captured.out)
-    assert out["data"]["result_count"] == 1
-    assert out["data"]["failed_count"] == 1
-    assert out["data"]["failed_results"][0]["url"] == "https://bad.example"
+    status = json.loads(captured.out)
+    payload = _assert_status_points_at_full_payload(status, "extract")
+    assert payload["data"]["result_count"] == 1
+    assert payload["data"]["failed_count"] == 1
+    assert payload["data"]["failed_results"][0]["url"] == "https://bad.example"
+    assert status["summary"]["failed_count"] == 1
     assert "Warning" in captured.err
+    assert "https://bad.example" not in captured.out
 
 
 def test_main_extract_all_failed(capsys, monkeypatch):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
     monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (401, None))
-    rc = cli.main(["extract", "https://example.com", "--stdout"])
+    rc = cli.main(["extract", "https://example.com"])
     assert rc == cli.EXIT_AUTH
 
 
-def test_main_search_text_maps_to_markdown_note(capsys, monkeypatch, search_with_content_fixture):
+def test_main_search_text_maps_to_markdown_note(capsys, monkeypatch, tmp_path, search_with_content_fixture):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
     monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, search_with_content_fixture))
-    rc = cli.main(["search", "q", "--max-results", "2", "--raw-content", "text", "--stdout"])
+    rc = cli.main(["search", "q", "--max-results", "2", "--raw-content", "text"])
     assert rc == 0
     captured = capsys.readouterr()
     assert "text maps to markdown" in captured.err
-    out = json.loads(captured.out)
-    assert out["data"]["results"][0]["raw_content"] is not None
+    payload = _assert_status_points_at_full_payload(json.loads(captured.out), "search")
+    assert payload["data"]["results"][0]["raw_content"] is not None
 
 
-def test_main_extract_format_text_note(capsys, monkeypatch, scrape_ok_fixture):
+def test_main_extract_format_text_note(capsys, monkeypatch, tmp_path, scrape_ok_fixture):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setenv(cli._OUTPUT_DIR_ENV, str(tmp_path))
     monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, scrape_ok_fixture))
-    rc = cli.main(["extract", "https://example.com", "--format", "text", "--stdout"])
+    rc = cli.main(["extract", "https://example.com", "--format", "text"])
     assert rc == 0
     captured = capsys.readouterr()
     assert "text maps to markdown" in captured.err
-    assert json.loads(captured.out)["data"]["result_count"] == 1
+    payload = _assert_status_points_at_full_payload(json.loads(captured.out), "extract")
+    assert payload["data"]["result_count"] == 1
 
 
 def test_main_search_file_output(capsys, tmp_path, monkeypatch, search_with_content_fixture):
@@ -876,6 +931,19 @@ def test_main_search_file_output(capsys, tmp_path, monkeypatch, search_with_cont
     assert out_file.exists()
     status = json.loads(capsys.readouterr().out)
     assert status["output_path"] == str(out_file)
+    assert json.loads(out_file.read_text(encoding="utf-8"))["data"]["result_count"] == 2
+
+
+def test_main_extract_named_output(capsys, tmp_path, monkeypatch, scrape_ok_fixture):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setattr(cli, "_post_json", lambda path, body, key, timeout: (200, scrape_ok_fixture))
+    out_file = tmp_path / "extract.json"
+    rc = cli.main(["extract", "https://example.com", "--output", str(out_file)])
+    assert rc == 0
+    status = json.loads(capsys.readouterr().out)
+    payload = _assert_status_points_at_full_payload(status, "extract")
+    assert Path(status["output_path"]) == out_file
+    assert payload["data"]["result_count"] == 1
 
 
 # ---------------------------------------------------------------------------

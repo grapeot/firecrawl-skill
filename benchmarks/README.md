@@ -84,6 +84,9 @@ isolates the parallelism win from the fixed-overhead win, so
 - **No secrets.** The script never reads `.env` and never prints or persists
   the API key; children resolve it themselves from the repo root or the
   ambient environment.
+- **No search `--stdout`.** Search benchmark child processes must not pass
+  `--stdout`. They write into the isolated output directory. The free `usage`
+  preflight may still pass `--stdout`.
 
 ## Cost
 
