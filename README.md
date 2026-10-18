@@ -109,15 +109,16 @@ Batch mode preserves the one-query-one-file corpus invariant: each query writes 
 
 URL content extraction via `POST /v2/scrape`, one request per URL (1–20 URLs per call). `--query` requests query-relevant highlights for each page.
 
-`--links` adds a `links` array to every successful per-URL result. It is off by default to keep payloads small, stays present when combined with `--query`, and is an empty list when upstream returns none. `--only-main-content` sets `onlyMainContent: true` on the scrape request; it cleans the markdown and does not filter `links`. Neither flag changes any existing result field, `failed_results`, or exit code.
+`--links` adds a `links` array to every successful per-URL result. It is off by default to keep payloads small, stays present when combined with `--query`, and is an empty list when upstream returns none. `--only-main-content` explicitly sends `onlyMainContent: true`, which is already Firecrawl's default, so it does not change results and does not filter `links`; `--no-only-main-content` sends `onlyMainContent: false` to request the full page. The two are mutually exclusive, and omitting both leaves the request body unchanged. None of these flags changes any existing result field, `failed_results`, or exit code.
 
 ```bash
 python -m firecrawl_skill extract https://example.com --links --only-main-content
+python -m firecrawl_skill extract https://example.com --links --no-only-main-content
 ```
 
 ### `scrape`
 
-Single-page structural capture via `POST /v2/scrape`: exactly one URL and exactly one of `--raw-html` (`rawHtml`), `--html` (cleaned HTML), or `--screenshot`. `--output PATH` is required for every format, and the parent directory must already exist.
+Single-page structural capture via `POST /v2/scrape`: exactly one URL and exactly one of `--raw-html` (`rawHtml`), `--html` (cleaned HTML), or `--screenshot`. `--output PATH` is required for every format; its parent must already exist and be writable, and the target must not be an existing directory. These checks run before any request, and `scrape` never creates directories.
 
 `scrape` is deliberately outside the snapshot corpus: it never writes `FIRECRAWL_CLI_OUTPUT_DIR`, never auto-names a file, and never adds a timestamped entry. The only file it writes is `--output`. Stdout still carries exactly one JSON status object; `--stdout` is rejected (exit 2), and the captured bytes never print inline.
 
@@ -185,7 +186,7 @@ The top-level structure is fixed:
 
 Every search and extract writes the complete payload to disk and emits a lightweight status object on stdout. Pass `--output PATH` to write that payload to a specific file instead of the default directory. For search, this applies only to single-query mode; batch search rejects it. `usage` also accepts `--output PATH`, mutually exclusive with `--stdout`. The full payload prints to stdout only for `usage --stdout`. See [Reading results from disk](skills/skill_firecrawl.md#reading-results-from-disk) for an executable status → exact path → JSON reader covering single search, extract, and batch search, with exit-code checks, bounded previews, and indexed range expansion.
 
-`scrape` follows the same stdout contract but not the corpus behavior: `--output` is mandatory, the file contains the captured HTML or image bytes rather than a JSON payload, and the status object is `{command, status, output_mode: "file", output_path, payload_bytes, summary: {url, format, credits_used}, payload_schema}`. `output_path` echoes the path exactly as given.
+`scrape` follows the same stdout contract but not the corpus behavior: `--output` is mandatory, the file contains the captured HTML or image bytes rather than a JSON payload, and the status object is `{command, status, output_mode: "file", output_path, payload_bytes, metadata, summary: {url, format, credits_used}, payload_schema}`. `metadata` is the upstream metadata object or `null`; `output_path` echoes the path exactly as given.
 
 ### Cost breakdown
 

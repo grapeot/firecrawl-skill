@@ -1629,6 +1629,31 @@ def test_scrape_request_max_age_zero_is_sent(tmp_path):
     assert cli._build_scrape_request(args)["maxAge"] == 0
 
 
+def test_scrape_output_prechecks(tmp_path, monkeypatch):
+    parent_file = tmp_path / "parent-file"
+    parent_file.write_text("not a directory", encoding="utf-8")
+    usage_error(["scrape", "https://example.com", "--raw-html", "--output", str(parent_file / "page.html")])
+    usage_error(["scrape", "https://example.com", "--raw-html", "--output", str(tmp_path)])
+
+    monkeypatch.setattr(cli.os, "access", lambda _path, _mode: False)
+    usage_error(["scrape", "https://example.com", "--raw-html", "--output", str(tmp_path / "page.html")])
+
+
+def test_scrape_duplicate_header_rejected(tmp_path):
+    base = _scrape_argv(tmp_path, "--html")
+    usage_error([*base, "--header", "X-Token: one", "--header", "x-token: two"])
+
+
+def test_scrape_status_metadata_and_schema(tmp_path):
+    args = parse(_scrape_argv(tmp_path, "--raw-html"))
+    with_metadata = cli._scrape_status(args, 12, {"data": {"metadata": {"title": "Example"}}})
+    assert with_metadata["metadata"] == {"title": "Example"}
+    assert with_metadata["payload_schema"]["metadata"] == "object|null"
+    without_metadata = cli._scrape_status(args, 12, {"data": {}})
+    assert "metadata" in without_metadata
+    assert without_metadata["metadata"] is None
+
+
 def test_capture_credits_priority():
     assert cli._capture_credits({
         "creditsUsed": 9,
@@ -1827,10 +1852,17 @@ def test_extract_links_and_only_main_content(scrape_ok_fixture):
     assert queried["links"] == []
     assert queried["highlights"] == ["hit"]
 
+    default_args = parse(["extract", "https://example.com"])
+    assert "onlyMainContent" not in cli._build_extract_request(default_args, "https://example.com")
+
     main_args = parse(["extract", "https://example.com", "--only-main-content"])
     main_request = cli._build_extract_request(main_args, "https://example.com")
     assert main_request["onlyMainContent"] is True
     assert main_request["formats"] == ["markdown"]
+    no_main_args = parse(["extract", "https://example.com", "--no-only-main-content"])
+    no_main_request = cli._build_extract_request(no_main_args, "https://example.com")
+    assert no_main_request["onlyMainContent"] is False
+    usage_error(["extract", "https://example.com", "--only-main-content", "--no-only-main-content"])
     both = parse(["extract", "https://example.com", "--links", "--only-main-content"])
     both_request = cli._build_extract_request(both, "https://example.com")
     assert both_request["formats"] == ["markdown", "links"]

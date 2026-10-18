@@ -379,7 +379,15 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument(
         "--only-main-content",
         action="store_true",
-        help="Set onlyMainContent: true (cleans markdown only; does not filter links)",
+        help=(
+            "Explicitly request onlyMainContent: true (matches the upstream default; "
+            "does not filter links)"
+        ),
+    )
+    extract_parser.add_argument(
+        "--no-only-main-content",
+        action="store_true",
+        help="Request the full page by sending onlyMainContent: false",
     )
 
     scrape_parser = subparsers.add_parser(
@@ -523,6 +531,7 @@ def _reject_content_stdout(parser: argparse.ArgumentParser, args: argparse.Names
 
 def _parse_scrape_headers(values: list[str]) -> dict[str, str]:
     parsed: dict[str, str] = {}
+    seen: set[str] = set()
     for raw in values:
         if ":" not in raw:
             raise ValueError("each --header must be 'Key: Value' with a non-empty key and value")
@@ -531,6 +540,10 @@ def _parse_scrape_headers(values: list[str]) -> dict[str, str]:
         value = value.strip()
         if not key or not value:
             raise ValueError("each --header must be 'Key: Value' with a non-empty key and value")
+        normalized = key.lower()
+        if normalized in seen:
+            raise ValueError(f"duplicate --header key: {key}")
+        seen.add(normalized)
         parsed[key] = value
     return parsed
 
@@ -562,9 +575,18 @@ def _validate_scrape_args(parser: argparse.ArgumentParser, args: argparse.Namesp
         parser.error("scrape requires exactly one of --raw-html, --html, or --screenshot.")
     if not args.output:
         parser.error("--output is required for scrape.")
-    parent = Path(args.output).expanduser().parent
-    if not parent.is_dir():
+    target = Path(args.output).expanduser()
+    parent = target.parent
+    if not parent.exists():
         parser.error(f"--output parent directory does not exist: {parent}")
+    if not parent.is_dir():
+        parser.error(f"--output parent is not a directory: {parent}")
+    if target.exists() and not target.is_file():
+        parser.error(f"--output must be a file path, not a directory: {target}")
+    if target.exists() and not os.access(target, os.W_OK):
+        parser.error(f"--output is not writable: {target}")
+    if not os.access(parent, os.W_OK):
+        parser.error(f"--output parent directory is not writable: {parent}")
     if args.full_page and not args.screenshot:
         parser.error("--full-page is only valid with --screenshot.")
     if args.viewport and not args.screenshot:
@@ -612,6 +634,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             parser.error("--chunks-per-source must be greater than 0.")
         if args.chunks_per_source is not None and not args.query:
             parser.error("--chunks-per-source requires --query.")
+        if args.only_main_content and args.no_only_main_content:
+            parser.error("Use either --only-main-content or --no-only-main-content, not both.")
         return
 
     has_positional_query = args.query is not None
@@ -728,6 +752,8 @@ def _build_extract_request(args: argparse.Namespace, url: str) -> dict[str, Any]
     }
     if args.only_main_content:
         request["onlyMainContent"] = True
+    elif args.no_only_main_content:
+        request["onlyMainContent"] = False
     return request
 
 
@@ -1657,14 +1683,14 @@ def _scrape_status(args: argparse.Namespace, payload_bytes: int, response: dict[
             "credits_used": _capture_credits(response),
         },
     }
-    if isinstance(metadata, dict):
-        status["metadata"] = metadata
+    status["metadata"] = metadata if isinstance(metadata, dict) else None
     status["payload_schema"] = {
         "command": "string",
         "status": "string",
         "output_mode": "string",
         "output_path": "string",
         "payload_bytes": "number",
+        "metadata": "object|null",
         "summary": {"url": "string", "format": "string", "credits_used": "number"},
     }
     return status

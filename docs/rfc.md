@@ -76,7 +76,8 @@ Upstream: `POST /v2/scrape`, one request per URL, sequential.
 | `--chunks-per-source` | — | accepted, warned, ignored (highlights do not cap passage count) |
 | `--extract-depth` | — | accepted, warned, ignored (scrape always fully renders) |
 | `--links` | `formats` += `"links"` | every successful per-URL result gains `links` (a list; empty list when upstream omits it). The field appears only when the flag is set, and it stays present when combined with `--query` |
-| `--only-main-content` | `onlyMainContent: true` | affects markdown cleaning only; `links` are not filtered by it |
+| `--only-main-content` | `onlyMainContent: true` | explicit true; upstream already defaults to true, so results are unchanged; does not filter `links` |
+| `--no-only-main-content` | `onlyMainContent: false` | request the full page; mutually exclusive with `--only-main-content` |
 | `--images` | `formats` += `"images"` | image URLs found on the page |
 | `--favicon` | — | not requested explicitly; `metadata.faviconUrl` passed through when present (verify field name against live responses during implementation) |
 | `--timeout` (s, default 60) | `timeout` (ms) | per-URL timeout, upstream max 300000 ms |
@@ -157,7 +158,7 @@ Upstream: `POST /v2/scrape`, one request per invocation.
 - `html` mode: read `data.html`.
 - `screenshot` mode: `data.screenshot` is a URL. Download it with stdlib `urllib.request`, enforce `--max-bytes`, verify the PNG signature, write to a temporary file, then `os.replace` onto `--output`.
 - Credits: read `data.metadata.creditsUsed`, then `data.metadata.creditCount`, then top-level `data.creditsUsed`; default to 0 when all are absent (the same defensive pattern `extract` uses).
-- Metadata: pass `data.metadata` through into the status object when it is a dict.
+- Metadata: always include `metadata` in the status object; use the `data.metadata` dict when present, otherwise `null`.
 - Payload size is the byte length of the file actually written (`payload_bytes`).
 
 ### Status object (scrape)
@@ -171,6 +172,7 @@ Stdout carries exactly one object:
   "output_mode": "file",
   "output_path": "/abs/or/given/path",
   "payload_bytes": 182344,
+  "metadata": {"title": "Example Domain"},
   "summary": {
     "url": "https://example.com",
     "format": "rawHtml",
@@ -182,6 +184,7 @@ Stdout carries exactly one object:
     "output_mode": "string",
     "output_path": "string",
     "payload_bytes": "number",
+    "metadata": "object|null",
     "summary": {"url": "string", "format": "string", "credits_used": "number"}
   }
 }
@@ -204,13 +207,13 @@ Stdout carries exactly one object:
 11. `search` batch (`--query` present): `--concurrency` ≥ 1; `--output` is a usage error. `--stdout` is a usage error for every search, including batch.
 12. `search`: empty or whitespace-only queries are usage errors, in both single and batch mode.
 13. `scrape`: exactly one of `--raw-html`, `--html`, `--screenshot` is required; none or more than one is a usage error (exit 2).
-14. `scrape`: `--output` is required. Its parent directory must already exist; `scrape` never creates it.
+14. `scrape`: `--output` is required. Its parent directory must already exist and be writable, and the target must not be an existing directory; these are checked before any request, and `scrape` never creates directories.
 15. `scrape`: `--full-page` and `--viewport` are valid only with `--screenshot`. Viewport is `WIDTHxHEIGHT` with both values positive integers.
 16. `scrape`: `--include-tags` and `--exclude-tags` are valid only with `--html`.
 17. `scrape`: `--max-age` ≥ 0; `--max-bytes` ≥ 1; `--timeout` > 0.
-18. `scrape`: every `--header` must be `Key: Value`; split on the first colon, trim both sides, and reject an empty key or value.
+18. `scrape`: every `--header` must be `Key: Value`; split on the first colon, trim both sides, reject an empty key or value, and reject duplicate keys case-insensitively.
 19. `scrape`: `--stdout` is rejected (exit 2, before any request, no file, no credits).
-20. `extract`: `--links` and `--only-main-content` are booleans and add no new validation; they leave every existing extract rule in place.
+20. `extract`: `--links`, `--only-main-content`, and `--no-only-main-content` are booleans. `--only-main-content` and `--no-only-main-content` are mutually exclusive; omitting both leaves `onlyMainContent` out of the request. They leave every existing extract rule in place.
 
 ## Normalization — `usage`
 
@@ -298,8 +301,8 @@ Batch mode keeps the same file naming but emits one file per query (one shared t
 ## Testing strategy
 
 - **Offline (`tests/test_unit.py`)**: argparse validation matrix (all rules above), ISO → `MM/DD/YYYY` conversion, `tbs` construction, request-body builders (search and extract, every flag combination that matters), envelope normalization from recorded fixtures, `cost_breakdown` reconstruction (base math, HTML/PDF/X/zero-doc classification, mismatch warning, absent-total), exit-code mapping from simulated HTTP responses (transport monkeypatched). No network, no key.
-- **Offline — `scrape` matrix**: parser defaults (format flags false, `--output` unset, default `--max-bytes`, `--timeout` 60); format mutual exclusion (none selected, two selected → exit 2); missing `--output` → exit 2; `--full-page`/`--viewport` with `--html`/`--raw-html` → exit 2; malformed viewport → exit 2; `--include-tags`/`--exclude-tags` with `--raw-html`/`--screenshot` → exit 2; header parsing (valid `Key: Value`, missing colon, empty key, empty value → exit 2); request bodies for `rawHtml`, `html` with tag filters plus `maxAge` and headers, and `screenshot` with `fullPage`/`viewport`, including the seconds → milliseconds timeout conversion; response normalization for all three formats; a mocked screenshot download with PNG signature validation; a failed download → exit 13; an oversized download or file → exit 12 with no partial file left behind.
-- **Offline — `extract` additions**: `--links` adds `"links"` to `formats` and normalizes `data.links` (present as an empty list when absent, still present with `--query`); `--only-main-content` sets `onlyMainContent: true`; without either flag the request body and per-URL result shape are unchanged.
+- **Offline — `scrape` matrix**: parser defaults (format flags false, `--output` unset, default `--max-bytes`, `--timeout` 60); format mutual exclusion (none selected, two selected → exit 2); missing `--output` → exit 2; missing or non-directory parent, unwritable parent, and an existing-directory target → exit 2 before any request; `--full-page`/`--viewport` with `--html`/`--raw-html` → exit 2; malformed viewport → exit 2; `--include-tags`/`--exclude-tags` with `--raw-html`/`--screenshot` → exit 2; header parsing (valid `Key: Value`, missing colon, empty key, empty value, duplicate key case-insensitive → exit 2); request bodies for `rawHtml`, `html` with tag filters plus `maxAge` and headers, and `screenshot` with `fullPage`/`viewport`, including the seconds → milliseconds timeout conversion; response normalization for all three formats; status metadata is always present and the schema lists `metadata`; a mocked screenshot download with PNG signature validation; a failed download → exit 13; an oversized download or file → exit 12 with no partial file left behind.
+- **Offline — `extract` additions**: `--links` adds `"links"` to `formats` and normalizes `data.links` (present as an empty list when absent, still present with `--query`); `--only-main-content` sends `true`, `--no-only-main-content` sends `false`, the two are mutually exclusive, and omitting both leaves `onlyMainContent` out of the request. Default request body and per-URL result shape are unchanged when no new flag is used.
 - **Live (`tests/test_integration.py`, opt-in via `RUN_FIRECRAWL_INTEGRATION=1`)**: 3–5 real calls (plain search, search + content, `--time-range`, extract with `--query`), asserting `success`, `credits_used` present, `raw_content` non-empty. Consumes a small number of credits. The `usage` live test adds one read-only billing call (0 credits) asserting `remaining_credits`/`plan_credits` are ints and `raw.credit_usage` agrees with the normalized fields; it skips when no key resolves.
 - **Live — `scrape` (opt-in)**: 2–3 additional tests — `--raw-html` against `https://example.com`, `--html` with `--include-tags` against the same page, and `extract --links`; assert the output file exists, is non-empty, and the status object reports `payload_bytes`. A live screenshot test is optional because it spends credits; it stays opt-in and skips when no key resolves.
 
@@ -308,10 +311,13 @@ Batch mode keeps the same file naming but emits one file per query (one shared t
 - Exact `/v2/scrape` response schema and where `creditsUsed`/`creditCount` live.
 - Favicon field name in `metadata`.
 - Whether `--topic news` + content scraping behaves identically to web (schema indicates `markdown` on news items; confirm).
-- `scrape` `rawHtml` output: confirm `data.rawHtml` is the raw field name and that `data.html` is the cleaned variant in live responses.
-- `scrape` screenshot request shape: confirm whether `formats: ["screenshot"]` takes a sibling screenshot-options object or an inline object, and confirm the response URL field name (`data.screenshot`).
 - Screenshot URL lifetime (the design records a 24-hour expiry) and whether the download response exposes a usable `Content-Type` in addition to the PNG signature check.
-- Whether `onlyMainContent` ever changes the `links` format upstream. The design assumes it does not; `extract --only-main-content --links` is the live check.
+- Whether `onlyMainContent` ever changes the `links` format upstream. The design assumes it does not; `extract --only-main-content --links` is the live check. The default value is confirmed `true` in the live docs (2026-10-18).
+
+Resolved during the `scrape` work (2026-10-18):
+
+- `data.rawHtml` is the raw field name; `data.html` is the cleaned variant. Both confirmed live against `https://example.com` (1 credit each, `metadata.creditsUsed`).
+- Screenshot request shape is the inline `{"type":"screenshot", ...}` object inside `formats`; the bare `"screenshot"` string is valid when no options are set. A live screenshot download produced a valid 1920×1080 PNG (1 credit).
 
 Resolved during the `usage` work (2026-10-03):
 

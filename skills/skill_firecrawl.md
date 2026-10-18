@@ -217,11 +217,12 @@ python -m firecrawl_skill extract https://firecrawl.dev --query "agent search" -
 
 `--query` requests query-relevant highlights for each page (Firecrawl returns the relevant passages; there is no chunk-count control).
 
-`--links` adds a `links` array to every successful per-URL result. It is opt-in so default payloads stay small, it remains present when combined with `--query`, and it is an empty list when upstream returns none. `--only-main-content` sets `onlyMainContent: true`: it cleans the markdown and does not filter `links`.
+`--links` adds a `links` array to every successful per-URL result. It is opt-in so default payloads stay small, it remains present when combined with `--query`, and it is an empty list when upstream returns none. `--only-main-content` explicitly sends `onlyMainContent: true`; because that is already Firecrawl's default, it does not change results and does not filter `links`. `--no-only-main-content` sends `onlyMainContent: false` to request the full page. The two flags are mutually exclusive, and omitting both leaves the request body unchanged.
 
 ```bash
 python -m firecrawl_skill extract https://example.com --links
 python -m firecrawl_skill extract https://example.com --links --only-main-content --output /tmp/site.json
+python -m firecrawl_skill extract https://example.com --links --no-only-main-content
 ```
 
 ### Single-page capture (scrape)
@@ -246,7 +247,7 @@ python -m firecrawl_skill scrape https://example.com --screenshot \
 - Screenshot responses carry a temporary URL, so the CLI downloads the image, verifies the PNG signature, and writes atomically. A failed download exits 13 and leaves no partial file.
 - `--max-bytes N` defaults to 5 MiB for HTML and 20 MiB for screenshots. Exceeding it exits 12 rather than truncating, and no partial file remains.
 - `--max-age MS` (non-negative milliseconds) and repeatable `--header 'Key: Value'` are supported. Header values are never logged or persisted.
-- `scrape` never writes `FIRECRAWL_CLI_OUTPUT_DIR`, never auto-names a file, and never adds a corpus entry. It writes only `--output`, whose parent directory must already exist.
+- `scrape` never writes `FIRECRAWL_CLI_OUTPUT_DIR`, never auto-names a file, and never adds a corpus entry. It writes only `--output`, whose parent must already exist and be writable; the target must not be an existing directory. These checks run before any request.
 - There are no actions, no LLM formats (`json`/`summary`/`question`), no `/extract`, and no batch input.
 
 ### Disable images or raw content
@@ -326,7 +327,8 @@ Check `data.remaining_credits` before a batch you expect to be expensive: at ~8 
 | `--format` | `markdown` / `text` (`text` maps to `markdown`) | `markdown` |
 | `--query` | Request query-relevant highlights per page | — |
 | `--links` | Add a `links` array to every successful per-URL result (present only when set) | `False` |
-| `--only-main-content` | Set `onlyMainContent: true`; cleans markdown only, does not filter `links` | `False` |
+| `--only-main-content` | Explicitly send `onlyMainContent: true`; matches the upstream default, so results are unchanged; does not filter `links` | unset (upstream `true`) |
+| `--no-only-main-content` | Send `onlyMainContent: false` to request the full page; mutually exclusive with `--only-main-content` | `False` |
 | `--extract-depth` | `basic` / `advanced` (accepted for compatibility; always ignored with a warning) | `advanced` |
 | `--chunks-per-source` | Accepted for compatibility; always ignored with a warning | — |
 | `--images` | Enable image extraction | `False` |
@@ -437,6 +439,7 @@ For `usage`, `data` carries the balance instead of results:
   "output_mode": "file",
   "output_path": "/tmp/example.html",
   "payload_bytes": 182344,
+  "metadata": { "title": "Example Domain" },
   "summary": { "url": "https://example.com", "format": "rawHtml", "credits_used": 1 },
   "payload_schema": {
     "command": "string",
@@ -444,6 +447,7 @@ For `usage`, `data` carries the balance instead of results:
     "output_mode": "string",
     "output_path": "string",
     "payload_bytes": "number",
+    "metadata": "object|null",
     "summary": { "url": "string", "format": "string", "credits_used": "number" }
   }
 }
