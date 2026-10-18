@@ -1435,4 +1435,470 @@ def test_cli_exit_other_codes_raise_systemexit():
         assert excinfo.value.code == code
 
 
+# ---------------------------------------------------------------------------
+# scrape + extract additions
+# ---------------------------------------------------------------------------
+
+
+_PNG = cli._PNG_SIGNATURE + b"png-body"
+
+
+class _FakeURLResponse:
+    def __init__(self, data, headers=None):
+        self._data = data
+        self._offset = 0
+        self.headers = headers or {}
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            n = len(self._data) - self._offset
+        chunk = self._data[self._offset:self._offset + n]
+        self._offset += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _scrape_argv(tmp_path, *extra, name="out.bin"):
+    return ["scrape", "https://example.com", "--output", str(tmp_path / name), *extra]
+
+
+def test_scrape_parser_defaults():
+    args = cli.build_parser().parse_args(["scrape", "https://example.com"])
+    assert args.command == "scrape"
+    assert args.url == "https://example.com"
+    assert args.raw_html is False
+    assert args.html is False
+    assert args.screenshot is False
+    assert args.output is None
+    assert args.full_page is False
+    assert args.viewport is None
+    assert args.include_tags == []
+    assert args.exclude_tags == []
+    assert args.max_age is None
+    assert args.headers == []
+    assert args.max_bytes is None
+    assert args.timeout == cli.DEFAULT_TIMEOUT
+    assert args.stdout is False
+    assert cli.SCRAPE_HTML_MAX_BYTES == 5 * 1024 * 1024
+    assert cli.SCRAPE_SCREENSHOT_MAX_BYTES == 20 * 1024 * 1024
+
+
+def test_scrape_max_bytes_defaults(tmp_path):
+    html_args = parse(_scrape_argv(tmp_path, "--html", name="a.html"))
+    shot_args = parse(_scrape_argv(tmp_path, "--screenshot", name="a.png"))
+    custom = parse(_scrape_argv(tmp_path, "--screenshot", "--max-bytes", "10", name="b.png"))
+    assert cli._effective_scrape_max_bytes(html_args) == cli.SCRAPE_HTML_MAX_BYTES
+    assert cli._effective_scrape_max_bytes(shot_args) == cli.SCRAPE_SCREENSHOT_MAX_BYTES
+    assert cli._effective_scrape_max_bytes(custom) == 10
+
+
+def test_scrape_format_required_and_exclusive():
+    usage_error(["scrape", "https://example.com", "--output", "/tmp/x.html"])
+    usage_error(["scrape", "https://example.com", "--raw-html", "--html", "--output", "/tmp/x.html"])
+    usage_error(["scrape", "https://example.com", "--raw-html", "--screenshot", "--output", "/tmp/x.html"])
+    usage_error(["scrape", "https://example.com", "--html", "--screenshot", "--output", "/tmp/x.html"])
+
+
+def test_scrape_output_required():
+    usage_error(["scrape", "https://example.com", "--raw-html"])
+    usage_error(["scrape", "https://example.com", "--html"])
+    usage_error(["scrape", "https://example.com", "--screenshot"])
+
+
+def test_scrape_output_parent_must_exist(tmp_path):
+    missing = tmp_path / "missing" / "page.html"
+    usage_error(["scrape", "https://example.com", "--raw-html", "--output", str(missing)])
+
+
+def test_scrape_screenshot_flags_rejected_on_other_formats(tmp_path):
+    usage_error(_scrape_argv(tmp_path, "--html", "--full-page"))
+    usage_error(_scrape_argv(tmp_path, "--raw-html", "--full-page"))
+    usage_error(_scrape_argv(tmp_path, "--html", "--viewport", "800x600"))
+    usage_error(_scrape_argv(tmp_path, "--raw-html", "--viewport", "800x600"))
+
+
+def test_scrape_viewport_must_be_positive_wxh(tmp_path):
+    for bad in ("bad", "0x600", "800x0", "800X600", "10x", "x10", "1.5x2"):
+        usage_error(_scrape_argv(tmp_path, "--screenshot", "--viewport", bad, name="a.png"))
+    usage_error(_scrape_argv(tmp_path, "--screenshot", "--viewport=-1x2", name="a.png"))
+
+
+def test_scrape_tag_filters_only_with_html(tmp_path):
+    usage_error(_scrape_argv(tmp_path, "--raw-html", "--include-tags", "main"))
+    usage_error(_scrape_argv(tmp_path, "--raw-html", "--exclude-tags", "nav"))
+    usage_error(_scrape_argv(tmp_path, "--screenshot", "--include-tags", "main", name="a.png"))
+    usage_error(_scrape_argv(tmp_path, "--screenshot", "--exclude-tags", "nav", name="a.png"))
+
+
+def test_scrape_header_max_age_max_bytes_timeout_validation(tmp_path):
+    base = _scrape_argv(tmp_path, "--html")
+    usage_error([*base, "--header", "NoColon"])
+    usage_error([*base, "--header", ": value"])
+    usage_error([*base, "--header", "Key:"])
+    usage_error([*base, "--header", "Key:   "])
+    usage_error([*base, "--header", "   : kept"])
+    usage_error([*base, "--max-age", "-1"])
+    usage_error([*base, "--max-bytes", "0"])
+    usage_error([*base, "--max-bytes", "-3"])
+    usage_error([*base, "--timeout", "0"])
+    usage_error([*base, "--timeout", "-1"])
+
+
+def test_scrape_stdout_rejected_before_request(monkeypatch, tmp_path):
+    def explode(*_args, **_kwargs):
+        raise AssertionError("network or key lookup was called")
+
+    monkeypatch.setattr(cli, "_post_json", explode)
+    monkeypatch.setattr(cli, "_get_api_key", explode)
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(_scrape_argv(tmp_path, "--raw-html", "--stdout"))
+    assert excinfo.value.code == 2
+
+
+def test_scrape_missing_parent_before_request(monkeypatch, tmp_path):
+    def explode(*_args, **_kwargs):
+        raise AssertionError("network or key lookup was called")
+
+    monkeypatch.setattr(cli, "_post_json", explode)
+    monkeypatch.setattr(cli, "_get_api_key", explode)
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["scrape", "https://example.com", "--html", "--output", str(tmp_path / "nope" / "a.html")])
+    assert excinfo.value.code == 2
+
+
+def test_scrape_request_raw_html(tmp_path):
+    args = parse(_scrape_argv(tmp_path, "--raw-html", "--timeout", "60"))
+    assert cli._build_scrape_request(args) == {
+        "url": "https://example.com",
+        "formats": ["rawHtml"],
+        "timeout": 60_000,
+    }
+
+
+def test_scrape_request_html_filters_age_headers_timeout(tmp_path):
+    args = parse(_scrape_argv(
+        tmp_path,
+        "--html",
+        "--include-tags", "main",
+        "--include-tags", "article",
+        "--exclude-tags", "nav",
+        "--max-age", "1500",
+        "--header", " User-Agent : Test Agent ",
+        "--header", "X-Token: secret:value",
+        "--timeout", "15",
+    ))
+    assert cli._build_scrape_request(args) == {
+        "url": "https://example.com",
+        "formats": ["html"],
+        "includeTags": ["main", "article"],
+        "excludeTags": ["nav"],
+        "maxAge": 1500,
+        "headers": {"User-Agent": "Test Agent", "X-Token": "secret:value"},
+        "timeout": 15_000,
+    }
+
+
+def test_scrape_request_screenshot_options(tmp_path):
+    args = parse(_scrape_argv(
+        tmp_path,
+        "--screenshot",
+        "--full-page",
+        "--viewport", "1440x900",
+        "--timeout", "30",
+        name="shot.png",
+    ))
+    request = cli._build_scrape_request(args)
+    assert request["formats"] == [{
+        "type": "screenshot",
+        "fullPage": True,
+        "viewport": {"width": 1440, "height": 900},
+    }]
+    assert request["timeout"] == 30_000
+    assert "onlyMainContent" not in request
+    plain = parse(_scrape_argv(tmp_path, "--screenshot", name="plain.png"))
+    assert cli._build_scrape_request(plain)["formats"] == ["screenshot"]
+
+
+def test_scrape_request_max_age_zero_is_sent(tmp_path):
+    args = parse(_scrape_argv(tmp_path, "--raw-html", "--max-age", "0"))
+    assert cli._build_scrape_request(args)["maxAge"] == 0
+
+
+def test_scrape_output_prechecks(tmp_path, monkeypatch):
+    parent_file = tmp_path / "parent-file"
+    parent_file.write_text("not a directory", encoding="utf-8")
+    usage_error(["scrape", "https://example.com", "--raw-html", "--output", str(parent_file / "page.html")])
+    usage_error(["scrape", "https://example.com", "--raw-html", "--output", str(tmp_path)])
+
+    monkeypatch.setattr(cli.os, "access", lambda _path, _mode: False)
+    usage_error(["scrape", "https://example.com", "--raw-html", "--output", str(tmp_path / "page.html")])
+
+
+def test_scrape_duplicate_header_rejected(tmp_path):
+    base = _scrape_argv(tmp_path, "--html")
+    usage_error([*base, "--header", "X-Token: one", "--header", "x-token: two"])
+
+
+def test_scrape_status_metadata_and_schema(tmp_path):
+    args = parse(_scrape_argv(tmp_path, "--raw-html"))
+    with_metadata = cli._scrape_status(args, 12, {"data": {"metadata": {"title": "Example"}}})
+    assert with_metadata["metadata"] == {"title": "Example"}
+    assert with_metadata["payload_schema"]["metadata"] == "object|null"
+    without_metadata = cli._scrape_status(args, 12, {"data": {}})
+    assert "metadata" in without_metadata
+    assert without_metadata["metadata"] is None
+
+
+def test_capture_credits_priority():
+    assert cli._capture_credits({
+        "creditsUsed": 9,
+        "data": {"creditsUsed": 4, "metadata": {"creditsUsed": 1, "creditCount": 2}},
+    }) == 1
+    assert cli._capture_credits({
+        "creditsUsed": 9,
+        "data": {"creditsUsed": 4, "metadata": {"creditCount": 2}},
+    }) == 2
+    assert cli._capture_credits({"creditsUsed": 9, "data": {"creditsUsed": 4}}) == 4
+    assert cli._capture_credits({"creditsUsed": 9, "data": {}}) == 9
+    assert cli._capture_credits({"data": {"metadata": {"creditsUsed": True, "creditCount": 3}}}) == 3
+    assert cli._capture_credits({}) == 0
+
+
+def _stub_scrape(monkeypatch, response, seen=None):
+    def fake_post(path, body, key, timeout):
+        if seen is not None:
+            seen["path"] = path
+            seen["body"] = body
+            seen["timeout"] = timeout
+        return 200, response
+
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setattr(cli, "_post_json", fake_post)
+    monkeypatch.setattr(cli, "get_default_output_dir", lambda: (_ for _ in ()).throw(AssertionError("corpus")))
+
+
+def test_scrape_raw_html_and_html_normalization(capsys, monkeypatch, tmp_path):
+    secret = "super-secret-token"
+    seen = {}
+    _stub_scrape(monkeypatch, {
+        "success": True,
+        "data": {
+            "rawHtml": "<html>raw café</html>",
+            "html": "<p>clean</p>",
+            "metadata": {"creditsUsed": 1, "title": "Example"},
+        },
+    }, seen)
+    raw_out = "raw-page.html"
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["scrape", "https://example.com", "--raw-html", "--output", raw_out, "--header", f"X-Token: {secret}"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    status = json.loads(captured.out)
+    assert status["command"] == "scrape"
+    assert status["status"] == "ok"
+    assert status["output_mode"] == "file"
+    assert status["output_path"] == raw_out
+    assert status["summary"] == {"url": "https://example.com", "format": "rawHtml", "credits_used": 1}
+    assert status["metadata"]["title"] == "Example"
+    written = (tmp_path / raw_out).read_bytes()
+    assert written == "<html>raw café</html>".encode("utf-8")
+    assert status["payload_bytes"] == len(written)
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert secret not in written.decode("utf-8")
+    assert seen["path"] == "/scrape"
+    assert seen["body"]["headers"] == {"X-Token": secret}
+    assert "<html>" not in captured.out
+
+    _stub_scrape(monkeypatch, {
+        "success": True,
+        "data": {"html": "<p>clean</p>", "metadata": {"creditCount": 2}},
+    })
+    html_out = tmp_path / "clean.html"
+    rc = cli.main(["scrape", "https://example.com", "--html", "--include-tags", "main", "--output", str(html_out)])
+    assert rc == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["output_path"] == str(html_out)
+    assert status["summary"]["format"] == "html"
+    assert status["summary"]["credits_used"] == 2
+    assert html_out.read_text(encoding="utf-8") == "<p>clean</p>"
+    assert not list(tmp_path.glob(".firecrawl-scrape-*"))
+
+
+def test_scrape_screenshot_download_png_and_limits(capsys, monkeypatch, tmp_path):
+    dest = tmp_path / "shot.png"
+    dest.write_bytes(b"keep-me")
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["timeout"] = timeout
+        seen["headers"] = dict(req.header_items())
+        return _FakeURLResponse(_PNG)
+
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
+    monkeypatch.setattr(cli, "get_default_output_dir", lambda: (_ for _ in ()).throw(AssertionError("corpus")))
+    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(cli, "_post_json", lambda *a, **k: (200, {
+        "success": True,
+        "data": {"screenshot": "https://cdn.example/shot.png", "metadata": {"creditsUsed": 1}},
+    }))
+    rc = cli.main(["scrape", "https://example.com", "--screenshot", "--timeout", "12", "--output", str(dest)])
+    assert rc == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["summary"]["format"] == "screenshot"
+    assert status["output_path"] == str(dest)
+    assert dest.read_bytes() == _PNG
+    assert status["payload_bytes"] == len(_PNG)
+    assert seen["url"] == "https://cdn.example/shot.png"
+    assert seen["timeout"] == 12
+    assert not any(key.lower() == "authorization" for key, _value in seen["headers"])
+    assert not list(tmp_path.glob(".firecrawl-scrape-*"))
+
+    dest.write_bytes(b"keep-me")
+    monkeypatch.setattr(cli.urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(cli.urllib.error.URLError("down")))
+    rc = cli.main(["scrape", "https://example.com", "--screenshot", "--output", str(dest)])
+    captured = capsys.readouterr()
+    assert rc == 13
+    assert captured.out == ""
+    err = json.loads(captured.err)
+    assert err["command"] == "scrape"
+    assert err["http_status"] is None
+    assert dest.read_bytes() == b"keep-me"
+    assert not list(tmp_path.glob(".firecrawl-scrape-*"))
+
+    dest.write_bytes(b"keep-me")
+    monkeypatch.setattr(cli.urllib.request, "urlopen", lambda *a, **k: _FakeURLResponse(b"not-a-png"))
+    rc = cli.main(["scrape", "https://example.com", "--screenshot", "--output", str(dest)])
+    assert rc == 13
+    assert capsys.readouterr().out == ""
+    assert dest.read_bytes() == b"keep-me"
+
+    dest.write_bytes(b"keep-me")
+    monkeypatch.setattr(
+        cli.urllib.request,
+        "urlopen",
+        lambda *a, **k: _FakeURLResponse(_PNG + b"x" * 50, headers={"Content-Length": "999999"}),
+    )
+    rc = cli.main(["scrape", "https://example.com", "--screenshot", "--max-bytes", "8", "--output", str(dest)])
+    captured = capsys.readouterr()
+    assert rc == 12
+    assert captured.out == ""
+    assert json.loads(captured.err)["command"] == "scrape"
+    assert dest.read_bytes() == b"keep-me"
+    assert not list(tmp_path.glob(".firecrawl-scrape-*"))
+
+
+def test_scrape_html_over_max_bytes_leaves_no_partial(capsys, monkeypatch, tmp_path):
+    dest = tmp_path / "big.html"
+    dest.write_text("keep", encoding="utf-8")
+    _stub_scrape(monkeypatch, {"success": True, "data": {"html": "x" * 40, "metadata": {"creditsUsed": 1}}})
+    rc = cli.main(["scrape", "https://example.com", "--html", "--max-bytes", "8", "--output", str(dest)])
+    captured = capsys.readouterr()
+    assert rc == 12
+    assert captured.out == ""
+    err = json.loads(captured.err)
+    assert err["command"] == "scrape"
+    assert "x" * 40 not in captured.err
+    assert dest.read_text(encoding="utf-8") == "keep"
+    assert not list(tmp_path.glob(".firecrawl-scrape-*"))
+
+
+def test_scrape_missing_field_and_upstream_error(capsys, monkeypatch, tmp_path):
+    dest = tmp_path / "missing.html"
+    _stub_scrape(monkeypatch, {"success": True, "data": {"markdown": "no html"}})
+    rc = cli.main(["scrape", "https://example.com", "--raw-html", "--output", str(dest)])
+    captured = capsys.readouterr()
+    assert rc == 12
+    assert captured.out == ""
+    assert not dest.exists()
+
+    monkeypatch.setattr(cli, "_post_json", lambda *a, **k: (401, {"error": "bad key"}))
+    rc = cli.main(["scrape", "https://example.com", "--html", "--output", str(tmp_path / "nope.html")])
+    captured = capsys.readouterr()
+    assert rc == 10
+    assert captured.out == ""
+    err = json.loads(captured.err)
+    assert err == {"command": "scrape", "http_status": 401, "error": "bad key"}
+    assert not (tmp_path / "nope.html").exists()
+
+
+def test_extract_links_and_only_main_content(scrape_ok_fixture):
+    links_args = parse(["extract", "https://example.com", "--links", "--timeout", "15"])
+    request = cli._build_extract_request(links_args, "https://example.com")
+    assert request == {
+        "url": "https://example.com",
+        "formats": ["markdown", "links"],
+        "timeout": 15_000,
+    }
+    present = cli._normalize_extract_result(
+        links_args, "https://example.com", {"data": {"markdown": "m", "links": ["https://a", "https://b"]}}
+    )
+    assert present["links"] == ["https://a", "https://b"]
+    absent = cli._normalize_extract_result(links_args, "https://example.com", {"data": {"markdown": "m"}})
+    assert absent["links"] == []
+    query_args = parse(["extract", "https://example.com", "--links", "--query", "domain"])
+    formats = cli._build_extract_formats(query_args)
+    assert "links" in formats
+    assert {"type": "highlights", "query": "domain"} in formats
+    queried = cli._normalize_extract_result(
+        query_args, "https://example.com", {"data": {"markdown": "m", "highlights": "hit"}}
+    )
+    assert queried["links"] == []
+    assert queried["highlights"] == ["hit"]
+
+    default_args = parse(["extract", "https://example.com"])
+    assert "onlyMainContent" not in cli._build_extract_request(default_args, "https://example.com")
+
+    main_args = parse(["extract", "https://example.com", "--only-main-content"])
+    main_request = cli._build_extract_request(main_args, "https://example.com")
+    assert main_request["onlyMainContent"] is True
+    assert main_request["formats"] == ["markdown"]
+    no_main_args = parse(["extract", "https://example.com", "--no-only-main-content"])
+    no_main_request = cli._build_extract_request(no_main_args, "https://example.com")
+    assert no_main_request["onlyMainContent"] is False
+    usage_error(["extract", "https://example.com", "--only-main-content", "--no-only-main-content"])
+    both = parse(["extract", "https://example.com", "--links", "--only-main-content"])
+    both_request = cli._build_extract_request(both, "https://example.com")
+    assert both_request["formats"] == ["markdown", "links"]
+    assert both_request["onlyMainContent"] is True
+
+
+def test_extract_default_payload_unchanged(monkeypatch, scrape_ok_fixture):
+    seen = {}
+
+    def fake_post(path, body, key, timeout):
+        seen["body"] = body
+        return 200, scrape_ok_fixture
+
+    monkeypatch.setattr(cli, "_post_json", fake_post)
+    args = parse(["extract", "https://example.com", "--timeout", "45"])
+    code, payload, error = cli.run_extract(args, "fc-test-key")
+    assert code == 0, error
+    assert seen["body"] == {
+        "url": "https://example.com",
+        "formats": ["markdown"],
+        "timeout": 45_000,
+    }
+    item = payload["data"]["results"][0]
+    assert set(item) == {"url", "markdown", "metadata", "error"}
+    assert "links" not in item
+    assert set(payload["input"]) == {
+        "urls",
+        "extract_depth",
+        "format",
+        "query",
+        "chunks_per_source",
+        "include_images",
+        "include_favicon",
+        "timeout",
+    }
+    assert "onlyMainContent" not in seen["body"]
+
+
 

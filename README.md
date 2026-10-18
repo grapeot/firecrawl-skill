@@ -1,8 +1,8 @@
 # firecrawl-skill
 
-Agent-facing web search, URL extraction, and account credit-usage reporting backed by the [Firecrawl v2 API](https://docs.firecrawl.dev/api-reference/endpoint/search).
+Agent-facing web search, URL extraction, single-page capture, and account credit-usage reporting backed by the [Firecrawl v2 API](https://docs.firecrawl.dev/api-reference/endpoint/search).
 
-The search and extract commands mirror [tavily-skill](https://github.com/grapeot/tavily-skill): the same subcommands (`search`, `extract`), the same flag names and defaults, the same JSON envelope, and the same file-output behavior, with one exception: `search` and `extract` do not accept `--stdout`. Workflows that read the payload file still see that envelope. `usage` is this repo's own addition — check it with `--help` before assuming any other flag names.
+The search and extract commands mirror [tavily-skill](https://github.com/grapeot/tavily-skill): the same subcommands (`search`, `extract`), the same flag names and defaults, the same JSON envelope, and the same file-output behavior, with one exception: `search` and `extract` do not accept `--stdout`. Workflows that read the payload file still see that envelope. `usage` and `scrape` are this repo's own additions — check them with `--help` before assuming any other flag names. `scrape` is the single-page structural primitive (one URL, one format, required `--output`) and is specified in [`docs/rfc.md`](docs/rfc.md) D9.
 
 ## Quickstart
 
@@ -38,6 +38,14 @@ python -m firecrawl_skill search "agent framework" \
 python -m firecrawl_skill extract https://example.com
 python -m firecrawl_skill extract https://example.com --query "agent search"
 
+# extraction with links and main-content cleaning
+python -m firecrawl_skill extract https://example.com --links --only-main-content
+
+# single-page capture: exactly one format, required --output, no snapshot corpus
+python -m firecrawl_skill scrape https://example.com --raw-html --output /tmp/example.html
+python -m firecrawl_skill scrape https://example.com --html --include-tags main --output /tmp/example-main.html
+python -m firecrawl_skill scrape https://example.com --screenshot --full-page --output /tmp/example.png
+
 # check remaining account credits (read-only, costs 0 credits)
 python -m firecrawl_skill usage --stdout
 
@@ -51,11 +59,18 @@ python -m firecrawl_skill usage --history 6 --stdout
 |---|---|
 | `FIRECRAWL_API_KEY` | Firecrawl API key (`fc-...`). Takes priority. |
 | `ONEPASSWORD_FIRECRAWL_REFERENCE` | Optional `op read`-compatible reference (e.g. `op://Vault/Item/field`). Used when `FIRECRAWL_API_KEY` is not set. Requires the 1Password CLI. |
-| `FIRECRAWL_CLI_OUTPUT_DIR` | Directory for auto-named payload files. Default: `./tmp/firecrawl/` (relative to the working directory). Point this at one dedicated, persistent directory so every payload accumulates as a timestamped corpus. |
+| `FIRECRAWL_CLI_OUTPUT_DIR` | Directory for auto-named payload files. Default: `./tmp/firecrawl/` (relative to the working directory). Point this at one dedicated, persistent directory so every payload accumulates as a timestamped corpus. `scrape` ignores this variable: it writes only the required `--output` path. |
 
 A local `.env` file in the working directory (or any parent directory) is loaded automatically.
 
 ## Commands
+
+| Command | Use it for | Input | Output |
+|---|---|---|---|
+| `search` | Discovery: find pages for a query | query text (single or batch) | full JSON payload file + status object |
+| `extract` | Batch content: markdown/highlights for 1–20 URLs | URL list | full JSON payload file + status object |
+| `scrape` | Single-page structure: raw HTML, cleaned HTML, or a screenshot | exactly one URL | the captured bytes at the required `--output`; status object on stdout |
+| `usage` | Remaining credits and per-period consumption | — | full payload (`--stdout`) or file + status object |
 
 ### `search`
 
@@ -94,7 +109,32 @@ Batch mode preserves the one-query-one-file corpus invariant: each query writes 
 
 URL content extraction via `POST /v2/scrape`, one request per URL (1–20 URLs per call). `--query` requests query-relevant highlights for each page.
 
-Full flag reference: `python -m firecrawl_skill search --help` / `extract --help`, or see `skills/skill_firecrawl.md`.
+`--links` adds a `links` array to every successful per-URL result. It is off by default to keep payloads small, stays present when combined with `--query`, and is an empty list when upstream returns none. `--only-main-content` explicitly sends `onlyMainContent: true`, which is already Firecrawl's default, so it does not change results and does not filter `links`; `--no-only-main-content` sends `onlyMainContent: false` to request the full page. The two are mutually exclusive, and omitting both leaves the request body unchanged. None of these flags changes any existing result field, `failed_results`, or exit code.
+
+```bash
+python -m firecrawl_skill extract https://example.com --links --only-main-content
+python -m firecrawl_skill extract https://example.com --links --no-only-main-content
+```
+
+### `scrape`
+
+Single-page structural capture via `POST /v2/scrape`: exactly one URL and exactly one of `--raw-html` (`rawHtml`), `--html` (cleaned HTML), or `--screenshot`. `--output PATH` is required for every format; its parent must already exist and be writable, and the target must not be an existing directory. These checks run before any request, and `scrape` never creates directories.
+
+`scrape` is deliberately outside the snapshot corpus: it never writes `FIRECRAWL_CLI_OUTPUT_DIR`, never auto-names a file, and never adds a timestamped entry. The only file it writes is `--output`. Stdout still carries exactly one JSON status object; `--stdout` is rejected (exit 2), and the captured bytes never print inline.
+
+```bash
+python -m firecrawl_skill scrape https://example.com --raw-html --output /tmp/example.html
+python -m firecrawl_skill scrape https://example.com --html --include-tags main --output /tmp/example-main.html
+python -m firecrawl_skill scrape https://example.com --screenshot --full-page --viewport 1440x900 --output /tmp/example.png
+```
+
+- `--include-tags` / `--exclude-tags` (repeatable CSS selectors) are valid only with `--html`; silently filtering `rawHtml` would make "raw" misleading.
+- `--full-page` and `--viewport WxH` are valid only with `--screenshot` (`WxH` uses positive integers).
+- `--max-age MS` (non-negative), repeatable `--header 'Key: Value'` (split on the first colon; values are never logged), `--max-bytes N` (default 5 MiB for HTML, 20 MiB for screenshots; exceeding it exits 12 rather than truncating), and `--timeout` (seconds, default 60) are supported.
+- A screenshot response is a temporary URL, so the CLI downloads it, verifies the PNG signature, and writes atomically. A failed download exits 13 and leaves no partial file.
+- There are no actions, no LLM formats (`json`/`summary`/`question`), and no batch mode.
+
+Full flag reference: `python -m firecrawl_skill search --help` / `extract --help` / `scrape --help`, or see `skills/skill_firecrawl.md`.
 
 ### `usage`
 
@@ -146,6 +186,8 @@ The top-level structure is fixed:
 
 Every search and extract writes the complete payload to disk and emits a lightweight status object on stdout. Pass `--output PATH` to write that payload to a specific file instead of the default directory. For search, this applies only to single-query mode; batch search rejects it. `usage` also accepts `--output PATH`, mutually exclusive with `--stdout`. The full payload prints to stdout only for `usage --stdout`. See [Reading results from disk](skills/skill_firecrawl.md#reading-results-from-disk) for an executable status → exact path → JSON reader covering single search, extract, and batch search, with exit-code checks, bounded previews, and indexed range expansion.
 
+`scrape` follows the same stdout contract but not the corpus behavior: `--output` is mandatory, the file contains the captured HTML or image bytes rather than a JSON payload, and the status object is `{command, status, output_mode: "file", output_path, payload_bytes, metadata, summary: {url, format, credits_used}, payload_schema}`. `metadata` is the upstream metadata object or `null`; `output_path` echoes the path exactly as given.
+
 ### Cost breakdown
 
 `search` and `extract` payloads carry a `data.cost_breakdown` object that reconstructs the Firecrawl credit charge per document, so a finished payload explains its own bill:
@@ -180,6 +222,8 @@ Credit cost is not linear: a plain HTML page is 1 credit, an x.com/twitter.com r
 
 The mapping is identical for `usage`: a documented `404 Could not find credit usage information` maps to 12, an unreachable or 5xx billing endpoint to 13.
 
+`scrape` adds no codes. Two local conditions reuse the table: an output larger than `--max-bytes` maps to 12 (rejected, no partial file), and a failed screenshot download maps to 13 (network/server class, no partial file).
+
 `search` batch mode is the one case where exit 0 also covers partial failure: when some `--query` values fail and at least one succeeds, the command exits 0 and the failures are reported per query in the status object (plus a stderr warning). If every query fails, the exit code is the first failure's mapped value.
 
 ## Credit accounting
@@ -188,6 +232,7 @@ The mapping is identical for `usage`: a documented `404 Could not find credit us
 |---|---|
 | `search` | 2 per 10 results, + 1 per scraped page when `--raw-content` is on |
 | `extract` | 1 per page, + 4 per page with `--query` (highlights) |
+| `scrape` | the upstream per-page scrape charge; `summary.credits_used` reports the actual figure |
 | `usage` | 0 (read-only billing endpoint) |
 
 `usage` is the only way to see your remaining balance from the CLI; it never costs credits. Firecrawl's plan name is not returned by any endpoint, so it is not reported — `plan_credits` is the plan's credit allotment and is the closest available signal.

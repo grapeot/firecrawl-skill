@@ -102,3 +102,54 @@ def test_usage_live(api_key):
     # audited against it.
     assert data["raw"]["credit_usage"]["data"]["remainingCredits"] == data["remaining_credits"]
     assert data["periods"] == []
+
+
+def test_scrape_live_raw_html(api_key, tmp_path):
+    out = tmp_path / "example.html"
+    args = cli.build_parser().parse_args(
+        ["scrape", "https://example.com", "--raw-html", "--output", str(out)]
+    )
+    cli._validate_args(cli.build_parser(), args)
+    rc, status, error = cli.run_scrape(args, api_key)
+    assert rc == 0, error
+    assert out.is_file() and out.stat().st_size > 0
+    assert status["payload_bytes"] == out.stat().st_size
+    assert status["summary"]["format"] == "rawHtml"
+    assert status["output_path"] == str(out)
+    assert b"<html" in out.read_bytes().lower()
+
+
+def test_scrape_live_html_include_tags(api_key, tmp_path):
+    out = tmp_path / "example-main.html"
+    args = cli.build_parser().parse_args(
+        ["scrape", "https://example.com", "--html", "--include-tags", "main", "--output", str(out)]
+    )
+    cli._validate_args(cli.build_parser(), args)
+    rc, status, error = cli.run_scrape(args, api_key)
+    assert rc == 0, error
+    assert out.is_file() and out.stat().st_size > 0
+    assert status["summary"]["format"] == "html"
+    assert status["payload_bytes"] == out.stat().st_size
+
+
+def test_extract_live_links(api_key):
+    args = cli.build_parser().parse_args(["extract", "https://example.com", "--links"])
+    cli._validate_args(cli.build_parser(), args)
+    rc, payload, error = cli.run_extract(args, api_key)
+    assert rc == 0, error
+    item = payload["data"]["results"][0]
+    assert isinstance(item["links"], list) and item["links"]
+    assert payload["data"]["credits_used"] is not None
+
+
+def test_scrape_live_screenshot(api_key, tmp_path):
+    out = tmp_path / "example.png"
+    args = cli.build_parser().parse_args(
+        ["scrape", "https://example.com", "--screenshot", "--output", str(out)]
+    )
+    cli._validate_args(cli.build_parser(), args)
+    rc, status, error = cli.run_scrape(args, api_key)
+    assert rc == 0, error
+    assert out.read_bytes().startswith(cli._PNG_SIGNATURE)
+    assert status["summary"]["format"] == "screenshot"
+    assert status["payload_bytes"] == out.stat().st_size

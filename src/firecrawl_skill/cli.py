@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """firecrawl_skill CLI.
 
-Agent-facing web search, URL extraction, and account credit-usage reporting over the
-Firecrawl v2 API. search and extract always write the full payload to a file and reject
---stdout before any request; usage still accepts --stdout. See docs/rfc.md.
+Agent-facing web search, URL extraction, single-page capture, and account credit-usage
+reporting over the Firecrawl v2 API. search and extract always write the full payload to
+a file and reject --stdout before any request; scrape writes captured bytes to a required
+--output and prints a status object; usage still accepts --stdout. See docs/rfc.md.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,6 +38,9 @@ DEFAULT_CONCURRENCY = 4
 MAX_RESULTS_LIMIT = 20
 MAX_URLS_LIMIT = 20
 MAX_USAGE_PERIODS = 100
+SCRAPE_HTML_MAX_BYTES = 5 * 1024 * 1024
+SCRAPE_SCREENSHOT_MAX_BYTES = 20 * 1024 * 1024
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 # Upstream billing endpoints. `usage` reads the first; the historical endpoint is the
 # only upstream source of per-period consumption (`--history`). The path is
@@ -75,6 +80,18 @@ class ApiError(Exception):
     def __init__(self, message: str, http_status: int | None = None) -> None:
         super().__init__(message)
         self.http_status = http_status
+
+
+class _ScrapeTooLarge(Exception):
+    pass
+
+
+class _ScrapeDownloadError(Exception):
+    pass
+
+
+class _ScrapeRejected(Exception):
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +371,108 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include favicon URLs from page metadata when present",
     )
+    extract_parser.add_argument(
+        "--links",
+        action="store_true",
+        help="Add a links array to every successful per-URL result (present only when set)",
+    )
+    extract_parser.add_argument(
+        "--only-main-content",
+        action="store_true",
+        help=(
+            "Explicitly request onlyMainContent: true (matches the upstream default; "
+            "does not filter links)"
+        ),
+    )
+    extract_parser.add_argument(
+        "--no-only-main-content",
+        action="store_true",
+        help="Request the full page by sending onlyMainContent: false",
+    )
+
+    scrape_parser = subparsers.add_parser(
+        "scrape",
+        help="Capture one URL as raw HTML, cleaned HTML, or a screenshot",
+    )
+    scrape_parser.add_argument("url", help="Exactly one URL to capture")
+    scrape_parser.add_argument(
+        "--raw-html",
+        action="store_true",
+        help="Capture unmodified HTML (exactly one of --raw-html, --html, --screenshot)",
+    )
+    scrape_parser.add_argument(
+        "--html",
+        action="store_true",
+        help="Capture cleaned HTML (exactly one of --raw-html, --html, --screenshot)",
+    )
+    scrape_parser.add_argument(
+        "--screenshot",
+        action="store_true",
+        help="Capture a screenshot and download the PNG (exactly one format flag)",
+    )
+    scrape_parser.add_argument(
+        "--output",
+        help="Required destination path; parent directory must already exist",
+    )
+    scrape_parser.add_argument(
+        "--full-page",
+        action="store_true",
+        help="Capture the full page; only valid with --screenshot",
+    )
+    scrape_parser.add_argument(
+        "--viewport",
+        help="Viewport WIDTHxHEIGHT with positive integers; only valid with --screenshot",
+    )
+    scrape_parser.add_argument(
+        "--include-tags",
+        dest="include_tags",
+        action="append",
+        default=[],
+        metavar="SELECTOR",
+        help="CSS selector to include; repeatable; only valid with --html",
+    )
+    scrape_parser.add_argument(
+        "--exclude-tags",
+        dest="exclude_tags",
+        action="append",
+        default=[],
+        metavar="SELECTOR",
+        help="CSS selector to exclude; repeatable; only valid with --html",
+    )
+    scrape_parser.add_argument(
+        "--max-age",
+        type=int,
+        help="Maximum cached-result age in milliseconds (non-negative)",
+    )
+    scrape_parser.add_argument(
+        "--header",
+        dest="headers",
+        action="append",
+        default=[],
+        metavar="KEY: VALUE",
+        help="Extra request header; repeatable; never logged or persisted",
+    )
+    scrape_parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Local size cap; exceeding it exits 12 and leaves no partial file "
+            f"(default {SCRAPE_HTML_MAX_BYTES} for html/rawHtml, "
+            f"{SCRAPE_SCREENSHOT_MAX_BYTES} for screenshot)"
+        ),
+    )
+    scrape_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT})",
+    )
+    scrape_parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Rejected for scrape (exit 2, before any request). Captured bytes always go to --output",
+    )
 
     usage_parser = subparsers.add_parser(
         "usage", help="Report Firecrawl account credit usage (no credits consumed)"
@@ -410,6 +529,87 @@ def _reject_content_stdout(parser: argparse.ArgumentParser, args: argparse.Names
         parser.error(_STDOUT_REJECTED)
 
 
+def _parse_scrape_headers(values: list[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    seen: set[str] = set()
+    for raw in values:
+        if ":" not in raw:
+            raise ValueError("each --header must be 'Key: Value' with a non-empty key and value")
+        key, value = raw.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value:
+            raise ValueError("each --header must be 'Key: Value' with a non-empty key and value")
+        normalized = key.lower()
+        if normalized in seen:
+            raise ValueError(f"duplicate --header key: {key}")
+        seen.add(normalized)
+        parsed[key] = value
+    return parsed
+
+
+def _parse_viewport(value: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d+)x(\d+)", value.strip())
+    if not match:
+        raise ValueError(f"--viewport must be WIDTHxHEIGHT with positive integers, got {value!r}")
+    width, height = int(match.group(1)), int(match.group(2))
+    if width < 1 or height < 1:
+        raise ValueError(f"--viewport must be WIDTHxHEIGHT with positive integers, got {value!r}")
+    return width, height
+
+
+def _validate_scrape_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than 0.")
+    if args.stdout:
+        parser.error(
+            "--stdout is not supported for scrape; captured bytes are written to --output "
+            "and stdout returns a status object."
+        )
+    selected = [name for name, enabled in (
+        ("--raw-html", args.raw_html),
+        ("--html", args.html),
+        ("--screenshot", args.screenshot),
+    ) if enabled]
+    if len(selected) != 1:
+        parser.error("scrape requires exactly one of --raw-html, --html, or --screenshot.")
+    if not args.output:
+        parser.error("--output is required for scrape.")
+    target = Path(args.output).expanduser()
+    parent = target.parent
+    if not parent.exists():
+        parser.error(f"--output parent directory does not exist: {parent}")
+    if not parent.is_dir():
+        parser.error(f"--output parent is not a directory: {parent}")
+    if target.exists() and not target.is_file():
+        parser.error(f"--output must be a file path, not a directory: {target}")
+    if target.exists() and not os.access(target, os.W_OK):
+        parser.error(f"--output is not writable: {target}")
+    if not os.access(parent, os.W_OK):
+        parser.error(f"--output parent directory is not writable: {parent}")
+    if args.full_page and not args.screenshot:
+        parser.error("--full-page is only valid with --screenshot.")
+    if args.viewport and not args.screenshot:
+        parser.error("--viewport is only valid with --screenshot.")
+    if args.viewport:
+        try:
+            _parse_viewport(args.viewport)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.include_tags and not args.html:
+        parser.error("--include-tags is only valid with --html.")
+    if args.exclude_tags and not args.html:
+        parser.error("--exclude-tags is only valid with --html.")
+    if args.max_age is not None and args.max_age < 0:
+        parser.error("--max-age must be greater than or equal to 0.")
+    if args.max_bytes is not None and args.max_bytes < 1:
+        parser.error("--max-bytes must be at least 1.")
+    try:
+        _parse_scrape_headers(args.headers)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.command == "usage":
         if args.timeout <= 0:
@@ -418,6 +618,10 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             parser.error("Use either --stdout or --output, not both.")
         if not 0 <= args.history <= MAX_USAGE_PERIODS:
             parser.error(f"--history must be between 0 and {MAX_USAGE_PERIODS} (0 = current period only).")
+        return
+
+    if args.command == "scrape":
+        _validate_scrape_args(parser, args)
         return
 
     if args.command == "extract":
@@ -430,6 +634,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             parser.error("--chunks-per-source must be greater than 0.")
         if args.chunks_per_source is not None and not args.query:
             parser.error("--chunks-per-source requires --query.")
+        if args.only_main_content and args.no_only_main_content:
+            parser.error("Use either --only-main-content or --no-only-main-content, not both.")
         return
 
     has_positional_query = args.query is not None
@@ -533,15 +739,68 @@ def _build_extract_formats(args: argparse.Namespace) -> list[Any]:
         formats.append("images")
     if args.query:
         formats.append({"type": "highlights", "query": args.query})
+    if args.links:
+        formats.append("links")
     return formats
 
 
 def _build_extract_request(args: argparse.Namespace, url: str) -> dict[str, Any]:
-    return {
+    request: dict[str, Any] = {
         "url": url,
         "formats": _build_extract_formats(args),
         "timeout": args.timeout * 1000,
     }
+    if args.only_main_content:
+        request["onlyMainContent"] = True
+    elif args.no_only_main_content:
+        request["onlyMainContent"] = False
+    return request
+
+
+def _scrape_format_name(args: argparse.Namespace) -> str:
+    if args.raw_html:
+        return "rawHtml"
+    if args.html:
+        return "html"
+    return "screenshot"
+
+
+def _effective_scrape_max_bytes(args: argparse.Namespace) -> int:
+    if args.max_bytes is not None:
+        return args.max_bytes
+    if args.screenshot:
+        return SCRAPE_SCREENSHOT_MAX_BYTES
+    return SCRAPE_HTML_MAX_BYTES
+
+
+def _build_scrape_request(args: argparse.Namespace) -> dict[str, Any]:
+    fmt = _scrape_format_name(args)
+    if fmt == "screenshot" and (args.full_page or args.viewport):
+        screenshot: dict[str, Any] = {"type": "screenshot"}
+        if args.full_page:
+            screenshot["fullPage"] = True
+        if args.viewport:
+            width, height = _parse_viewport(args.viewport)
+            screenshot["viewport"] = {"width": width, "height": height}
+        formats: list[Any] = [screenshot]
+    else:
+        formats = [fmt]
+    request: dict[str, Any] = {
+        "url": args.url,
+        "formats": formats,
+        "timeout": args.timeout * 1000,
+    }
+    if fmt == "html":
+        if args.include_tags:
+            request["includeTags"] = list(args.include_tags)
+        if args.exclude_tags:
+            request["excludeTags"] = list(args.exclude_tags)
+    if args.max_age is not None:
+        request["maxAge"] = args.max_age
+    headers = _parse_scrape_headers(args.headers)
+    if headers:
+        request["headers"] = headers
+    return request
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +1152,9 @@ def _normalize_extract_result(args: argparse.Namespace, url: str, response: dict
         item["highlights"] = _normalize_highlights(data.get("highlights"))
     if args.include_images:
         item["images"] = data.get("images") or []
+    if args.links:
+        links = data.get("links")
+        item["links"] = list(links) if isinstance(links, list) else []
     if not args.include_favicon and isinstance(item.get("metadata"), dict) and "favicon" in item["metadata"]:
         item["metadata"] = {k: v for k, v in item["metadata"].items() if k != "favicon"}
     return item
@@ -1334,6 +1596,153 @@ def run_search_batch(
     return EXIT_OK, batch_status, None
 
 
+def _capture_credits(response: dict[str, Any]) -> int:
+    data = response.get("data")
+    data = data if isinstance(data, dict) else {}
+    metadata = data.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for candidate in (
+        metadata.get("creditsUsed"),
+        metadata.get("creditCount"),
+        data.get("creditsUsed"),
+        response.get("creditsUsed"),
+    ):
+        value = _as_int(candidate)
+        if value is not None:
+            return value
+    return 0
+
+
+def _download_screenshot(url: str, timeout: float, max_bytes: int) -> bytes:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise _ScrapeDownloadError("screenshot download failed")
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            declared = resp.headers.get("Content-Length")
+            if declared is not None:
+                try:
+                    if int(declared) > max_bytes:
+                        raise _ScrapeTooLarge()
+                except ValueError:
+                    pass
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise _ScrapeTooLarge()
+                chunks.append(chunk)
+            data = b"".join(chunks)
+    except _ScrapeTooLarge:
+        raise
+    except Exception:
+        raise _ScrapeDownloadError("screenshot download failed")
+    if not data.startswith(_PNG_SIGNATURE):
+        raise _ScrapeDownloadError("screenshot is not a valid PNG")
+    return data
+
+
+def _write_atomic(path: str, data: bytes) -> int:
+    target = Path(path).expanduser()
+    fd, tmp_name = tempfile.mkstemp(prefix=".firecrawl-scrape-", dir=target.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return target.stat().st_size
+
+
+def _scrape_status(args: argparse.Namespace, payload_bytes: int, response: dict[str, Any]) -> dict[str, Any]:
+    data = response.get("data")
+    data = data if isinstance(data, dict) else {}
+    metadata = data.get("metadata")
+    status: dict[str, Any] = {
+        "command": "scrape",
+        "status": "ok",
+        "output_mode": "file",
+        "output_path": args.output,
+        "payload_bytes": payload_bytes,
+        "summary": {
+            "url": args.url,
+            "format": _scrape_format_name(args),
+            "credits_used": _capture_credits(response),
+        },
+    }
+    status["metadata"] = metadata if isinstance(metadata, dict) else None
+    status["payload_schema"] = {
+        "command": "string",
+        "status": "string",
+        "output_mode": "string",
+        "output_path": "string",
+        "payload_bytes": "number",
+        "metadata": "object|null",
+        "summary": {"url": "string", "format": "string", "credits_used": "number"},
+    }
+    return status
+
+
+def _materialize_scrape(args: argparse.Namespace, response: dict[str, Any]) -> dict[str, Any]:
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise _ScrapeRejected("scrape response did not include data")
+    fmt = _scrape_format_name(args)
+    max_bytes = _effective_scrape_max_bytes(args)
+    if fmt == "screenshot":
+        url = data.get("screenshot")
+        if not isinstance(url, str) or not url:
+            raise _ScrapeRejected("scrape response did not include screenshot")
+        body = _download_screenshot(url, args.timeout, max_bytes)
+    else:
+        text = data.get(fmt)
+        if not isinstance(text, str):
+            raise _ScrapeRejected(f"scrape response did not include {fmt}")
+        body = text.encode("utf-8")
+        if len(body) > max_bytes:
+            raise _ScrapeTooLarge()
+    payload_bytes = _write_atomic(args.output, body)
+    return _scrape_status(args, payload_bytes, response)
+
+
+def run_scrape(
+    args: argparse.Namespace, api_key: str
+) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
+    status, payload = _post_json("/scrape", _build_scrape_request(args), api_key, args.timeout)
+    code = _exit_code_for(status, payload)
+    if code != EXIT_OK or not isinstance(payload, dict):
+        return code if code != EXIT_OK else EXIT_REJECTED, None, {
+            "http_status": status,
+            "error": _error_message(status, payload if isinstance(payload, dict) else None),
+        }
+    try:
+        return EXIT_OK, _materialize_scrape(args, payload), None
+    except _ScrapeTooLarge:
+        return EXIT_REJECTED, None, {
+            "http_status": status,
+            "error": f"payload exceeds --max-bytes ({_effective_scrape_max_bytes(args)})",
+        }
+    except _ScrapeDownloadError as exc:
+        return EXIT_NETWORK_SERVER, None, {"http_status": None, "error": str(exc)}
+    except _ScrapeRejected as exc:
+        return EXIT_REJECTED, None, {"http_status": status, "error": str(exc)}
+    except OSError:
+        return EXIT_NETWORK_SERVER, None, {"http_status": None, "error": "failed to write scrape output"}
+
+
 def run_extract(
     args: argparse.Namespace, api_key: str
 ) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
@@ -1481,6 +1890,8 @@ def main(argv: list[str] | None = None) -> int:
             code, payload, error = run_search(args, api_key)
         elif args.command == "extract":
             code, payload, error = run_extract(args, api_key)
+        elif args.command == "scrape":
+            code, payload, error = run_scrape(args, api_key)
         elif args.command == "usage":
             code, payload, error = run_usage(args, api_key)
         else:
@@ -1489,6 +1900,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
         return 130
+
+    if args.command == "scrape":
+        if code != EXIT_OK:
+            _report_failure("scrape", code, error or {"http_status": None, "error": "request failed"})
+            return code
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return EXIT_OK
 
     if args.command == "search" and _is_batch(args):
         # Batch mode always prints the status envelope; on total failure the mapped
