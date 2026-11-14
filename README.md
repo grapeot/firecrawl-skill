@@ -222,6 +222,8 @@ Credit cost is not linear: a plain HTML page is 1 credit, an x.com/twitter.com r
 
 The mapping is identical for `usage`: a documented `404 Could not find credit usage information` maps to 12, an unreachable or 5xx billing endpoint to 13.
 
+A response body cut short in transit (`http.client.IncompleteRead`, seen behind some forward proxies) is a network failure and maps to 13. Firecrawl may already have billed such a request; the CLI does not retry it.
+
 `scrape` adds no codes. Two local conditions reuse the table: an output larger than `--max-bytes` maps to 12 (rejected, no partial file), and a failed screenshot download maps to 13 (network/server class, no partial file).
 
 `search` batch mode is the one case where exit 0 also covers partial failure: when some `--query` values fail and at least one succeeds, the command exits 0 and the failures are reported per query in the status object (plus a stderr warning). If every query fails, the exit code is the first failure's mapped value.

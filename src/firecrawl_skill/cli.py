@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import http.client
 import json
 import math
 import os
@@ -808,6 +809,63 @@ def _build_scrape_request(args: argparse.Namespace) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+class _KeepAliveHTTPSConnection(http.client.HTTPSConnection):
+    """Ask for a persistent connection instead of urllib's forced `Connection: close`.
+
+    With `Connection: close` the origin closes the socket right after the last byte. Some
+    forward proxies (seen with the Claude Code sandbox proxy) then drop the tail of any
+    response larger than a few KB: the read fails with `http.client.IncompleteRead` although
+    Firecrawl has served and billed the request. With keep-alive the client reads exactly
+    Content-Length bytes and closes the connection itself (urllib does that when the response
+    is closed), so it is still one request per connection and nothing is left open.
+    """
+
+    def putheader(self, header: Any, *values: Any) -> None:
+        if (
+            isinstance(header, str)
+            and header.lower() == "connection"
+            and len(values) == 1
+            and isinstance(values[0], str)
+            and values[0].strip().lower() == "close"
+        ):
+            values = ("keep-alive",)
+        super().putheader(header, *values)
+
+
+class _KeepAliveHTTPSHandler(urllib.request.HTTPSHandler):
+    def do_open(self, http_class: Any, req: urllib.request.Request, **http_conn_args: Any) -> Any:
+        # Same call urllib makes, with the connection class swapped; the keyword arguments
+        # (context, and check_hostname on Python 3.9-3.11) pass through unchanged.
+        return super().do_open(_KeepAliveHTTPSConnection, req, **http_conn_args)
+
+
+_opener: urllib.request.OpenerDirector | None = None
+
+
+def _open(req: urllib.request.Request, timeout: float) -> Any:
+    """`urllib.request.urlopen` for the Firecrawl API, with the keep-alive HTTPS handler.
+
+    The opener is built on first use, like urllib's own default opener, so proxy settings that
+    `load_workspace_env` reads from a `.env` are in the environment by then.
+    """
+    global _opener
+    if _opener is None:
+        _opener = urllib.request.build_opener(_KeepAliveHTTPSHandler())
+    return _opener.open(req, timeout=timeout)
+
+
+# A body cut short in transit raises http.client.IncompleteRead, which is not an OSError. It is
+# a network-level failure like a timeout: report it as one (exit 13), not as a traceback (exit 1).
+_NETWORK_ERRORS = (
+    urllib.error.URLError,
+    socket.timeout,
+    TimeoutError,
+    ConnectionError,
+    OSError,
+    http.client.HTTPException,
+)
+
+
 def _post_json(path: str, body: dict[str, Any], api_key: str, timeout: float) -> tuple[int | None, dict[str, Any] | None]:
     """POST JSON to the Firecrawl API. Returns (http_status, parsed_body).
 
@@ -825,17 +883,17 @@ def _post_json(path: str, body: dict[str, Any], api_key: str, timeout: float) ->
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open(req, timeout) as resp:
             raw = resp.read().decode("utf-8")
             status = resp.status
     except urllib.error.HTTPError as exc:
         status = exc.code
         try:
             raw = exc.read().decode("utf-8")
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, http.client.HTTPException):
             raw = ""
         return status, _parse_json_dict(raw)
-    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError):
+    except _NETWORK_ERRORS:
         return None, None
 
     return status, _parse_json_dict(raw)
@@ -867,15 +925,15 @@ def _get_json(
         method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open(req, timeout) as resp:
             return resp.status, _parse_json_dict(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
             raw = exc.read().decode("utf-8")
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, http.client.HTTPException):
             raw = ""
         return exc.code, _parse_json_dict(raw)
-    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError):
+    except _NETWORK_ERRORS:
         return None, None
 
 

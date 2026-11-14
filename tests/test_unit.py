@@ -1901,4 +1901,78 @@ def test_extract_default_payload_unchanged(monkeypatch, scrape_ok_fixture):
     assert "onlyMainContent" not in seen["body"]
 
 
+# --- transport: keep-alive request, truncated body ---------------------------------------
+
+
+def test_api_request_asks_for_keep_alive_and_reads_the_body_while_the_server_stays_open():
+    """One real HTTP exchange over a local socket pair (no network, no TLS)."""
+    import socket
+    import threading
+
+    client_end, server_end = socket.socketpair()
+    seen = {}
+
+    class Plain(cli._KeepAliveHTTPSConnection):  # the class under test, minus the TLS handshake
+        def connect(self):
+            self.sock = client_end
+
+    def server():
+        data = b""
+        while b"\r\n\r\n" not in data:
+            data += server_end.recv(65536)
+        seen["request"] = data
+        body = b"x" * 200_000
+        server_end.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        # no close: a keep-alive server leaves the connection open after the response
+
+    thread = threading.Thread(target=server)
+    thread.start()
+    conn = Plain("api.invalid", timeout=10)
+    # urllib's AbstractHTTPHandler.do_open always passes `Connection: close`.
+    conn.request("POST", "/v2/scrape", body=b"{}", headers={"Connection": "close", "Content-Type": "application/json"})
+    body = conn.getresponse().read()
+    thread.join()
+    conn.close()
+    server_end.close()
+
+    assert len(body) == 200_000
+    assert b"Connection: keep-alive" in seen["request"]
+    assert b"Connection: close" not in seen["request"]
+    assert b"Content-Type: application/json" in seen["request"]
+
+
+def test_api_opener_uses_the_keep_alive_connection_class(monkeypatch):
+    seen = {}
+
+    def fake_do_open(self, http_class, req, **kwargs):
+        seen["http_class"] = http_class
+        seen["kwargs"] = kwargs
+        raise cli.urllib.error.URLError("stop before any network use")
+
+    monkeypatch.setattr(cli.urllib.request.AbstractHTTPHandler, "do_open", fake_do_open)
+    monkeypatch.setattr(cli, "_opener", None)
+    assert cli._post_json("/scrape", {"url": "https://example.com"}, "fc-test", 5) == (None, None)
+    assert seen["http_class"] is cli._KeepAliveHTTPSConnection
+    assert "context" in seen["kwargs"]
+
+
+def test_truncated_body_is_a_network_error_not_a_traceback(monkeypatch):
+    import http.client
+
+    class Truncated:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            raise http.client.IncompleteRead(b'{"success": tr', 4096)
+
+    monkeypatch.setattr(cli, "_open", lambda req, timeout: Truncated())
+    assert cli._post_json("/scrape", {"url": "https://example.com"}, "fc-test", 5) == (None, None)
+    assert cli._get_json("/team/credit-usage", "fc-test", 5) == (None, None)
+    assert cli._exit_code_for(None, None) == cli.EXIT_NETWORK_SERVER
 
